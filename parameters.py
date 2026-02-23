@@ -18,6 +18,7 @@ AGENTS_RANGE = (10, 20)
 TASKS_RANGE = (20, 50)
 COALITION_SIZE = 5
 MAX_TIME = 100
+EVAL_MAX_WAITING_TIME = 10
 TRAIT_DIM = 1
 
 # v0.1 dynamic coalition/task settings

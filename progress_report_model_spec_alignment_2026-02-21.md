@@ -312,3 +312,47 @@
 - `P1`：已完成（新旧指标并行已落地到训练、测试、绘图链路）。  
 - `P2`：已完成首版（固定 seed 回归与对照报告工具已就位并可执行）。  
 - 下一阶段可进入：短训练回归与参数稳定性调优（在依赖环境补齐后执行）。
+
+## 12. 2026-02-23 baseline 最小对齐层（已完成）
+
+### 12.1 目标
+
+在不改 baseline 求解核心语义的前提下，先完成“统一评测参数 + 统一输出接口”，为后续公平对齐改造打底。
+
+### 12.2 已改动
+
+1. 统一评测参数入口：
+- `parameters.py` 新增 `EVAL_MAX_WAITING_TIME = 10`
+- baseline 回放时统一传入：
+  - `max_time=MAX_TIME`
+  - `max_waiting_time=EVAL_MAX_WAITING_TIME`
+
+2. baseline 输出指标统一到新 schema（并行兼容）：
+- 文件：
+  - `baselines/OR-Tools.py`
+  - `baselines/CTAS-D.py`
+- 新增输出：
+  - `utilization_exec`
+  - `utilization_wait`
+  - `utilization_travel`
+- 兼容保留：
+  - `efficiency`（映射为 `utilization_exec`）
+
+3. baseline 回放接口支持显式评测参数：
+- `env/task_env.py`:
+  - `execute_by_route(path, method, plot_figure, max_time, max_waiting_time)`
+
+### 12.3 新增接口文档
+
+- `pipeline_interface_env_eval_v0_2.md`
+
+内容覆盖：
+
+- RL / OR-Tools / CTAS-D 三条 pipeline 的环境接口与评估接口；
+- 统一指标 schema；
+- 后续语义对齐的优先级与修改入口。
+
+### 12.4 状态结论
+
+- “同执行环境 + 同评测参数 + 同输出接口” 已完成；
+- “同优化目标语义（动态 workload 在线协同）” 尚未完成，属于后续深度对齐阶段。

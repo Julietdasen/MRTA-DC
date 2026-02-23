@@ -11,6 +11,7 @@ import copy
 import os.path
 
 from env.task_env import TaskEnv
+from parameters import MAX_TIME, EVAL_MAX_WAITING_TIME
 import math
 import numpy as np
 from ortools.constraint_solver import routing_enums_pb2
@@ -170,7 +171,17 @@ if __name__ == '__main__':
     folder = 'testSet_20A_50T_CONDET'
     method = 'OR-Tools'
     files = natsorted(glob.glob(f'./{folder}/env_*.pkl'), key=lambda y: y.lower())
-    perf_metrics = {'success_rate':[], 'makespan': [], 'time_cost':[], 'waiting_time': [], 'travel_dist': [], 'efficiency': []}
+    perf_metrics = {
+        'success_rate': [],
+        'makespan': [],
+        'time_cost': [],
+        'waiting_time': [],
+        'travel_dist': [],
+        'utilization_exec': [],
+        'utilization_wait': [],
+        'utilization_travel': [],
+        'efficiency': [],
+    }
     for i in files:
         env = pickle.load(open(i, 'rb'))
         agents = env.agent_dic
@@ -183,23 +194,37 @@ if __name__ == '__main__':
         if method == 'OR-Tools':
             solver.VRP(env)
         env.force_wait = True
-        env.execute_by_route(i.replace('.pkl', '/'), method, False)
-        reward, finished_tasks = env.get_episode_reward(100)
+        env.max_waiting_time = EVAL_MAX_WAITING_TIME
+        env.execute_by_route(
+            i.replace('.pkl', '/'),
+            method,
+            False,
+            max_time=MAX_TIME,
+            max_waiting_time=EVAL_MAX_WAITING_TIME,
+        )
+        reward, finished_tasks = env.get_episode_reward(MAX_TIME)
         if np.sum(finished_tasks) / len(finished_tasks) < 1:
             perf_metrics['success_rate'].append(np.sum(finished_tasks) / len(finished_tasks))
             perf_metrics['makespan'].append(np.nan)
             perf_metrics['time_cost'].append(np.nan)
             perf_metrics['waiting_time'].append(np.nan)
             perf_metrics['travel_dist'].append(np.nan)
+            perf_metrics['utilization_exec'].append(np.nan)
+            perf_metrics['utilization_wait'].append(np.nan)
+            perf_metrics['utilization_travel'].append(np.nan)
             perf_metrics['efficiency'].append(np.nan)
         else:
+            util_exec, util_wait, util_travel = env.get_utilization_metrics()
             perf_metrics['success_rate'].append(np.sum(finished_tasks) / len(finished_tasks))
             perf_metrics['makespan'].append(env.current_time)
-            perf_metrics['time_cost'].append(np.sum(np.nan_to_num(env.get_matrix(env.task_dic, 'time_start'), nan=100)))
+            perf_metrics['time_cost'].append(np.nanmean(env.get_matrix(env.task_dic, 'time_start')))
             perf_metrics['waiting_time'].append(np.mean(env.get_matrix(env.agent_dic, 'sum_waiting_time')))
             perf_metrics['travel_dist'].append(np.sum(env.get_matrix(env.agent_dic, 'travel_dist')))
-            perf_metrics['efficiency'].append(np.mean(env.get_matrix(env.task_dic, 'sum_waiting_time')))
+            perf_metrics['utilization_exec'].append(util_exec)
+            perf_metrics['utilization_wait'].append(util_wait)
+            perf_metrics['utilization_travel'].append(util_travel)
+            # Backward-compatible alias.
+            perf_metrics['efficiency'].append(util_exec)
         print(i)
     df = pd.DataFrame(perf_metrics)
     df.to_csv(f'./{folder}/{method}.csv')
-

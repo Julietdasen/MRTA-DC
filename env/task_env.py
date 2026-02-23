@@ -797,10 +797,11 @@ class TaskEnv:
                 grouped_agents[keys] = int(agent_v_r[i])
         return grouped_tasks, grouped_agents
 
-    def execute_by_route(self, path='./', method=0, plot_figure=False):
+    def execute_by_route(self, path='./', method=0, plot_figure=False, max_time=200, max_waiting_time=100):
         self.plot_figure = plot_figure
-        self.max_waiting_time = 100
-        while not self.finished and self.current_time < 200:
+        if max_waiting_time is not None:
+            self.max_waiting_time = float(max_waiting_time)
+        while not self.finished and self.current_time < float(max_time):
             if self.reactive_planning:
                 self.visible_length = int(np.clip(self.current_time//10 * 20 + 20, 20, 100))
             decision_agents, current_time = self.next_decision()

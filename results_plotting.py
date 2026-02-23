@@ -12,69 +12,104 @@ if not os.path.exists(f'{folder}/metrics'):
     os.mkdir(f'{folder}/metrics')
 dfs = []
 files = []
-labels = ['Success Rate', 'Makespan', 'Time Cost', 'Average Waiting Time', 'Sum Traveling Distance', 'Efficiency']
-labels_in_csv = ['success_rate', 'makespan', 'time_cost', 'waiting_time', 'travel_dist', 'efficiency']
+metric_specs = [
+    ('Success Rate', ['success_rate']),
+    ('Makespan', ['makespan']),
+    ('Time Cost', ['time_cost']),
+    ('Average Waiting Time', ['waiting_time']),
+    ('Sum Traveling Distance', ['travel_dist']),
+    # Backward-compatible: prefer utilization_exec, fallback to legacy efficiency.
+    ('Efficiency', ['utilization_exec', 'efficiency']),
+]
+optional_metric_specs = [
+    ('Utilization Wait', ['utilization_wait']),
+    ('Utilization Travel', ['utilization_travel']),
+]
 methods = natsorted(glob.glob(f'{folder}/*.csv'), key=lambda y: y.lower())
 for file in methods:
     if file.endswith('.csv'):
         files.append(file.split('/')[1].replace('.csv', ''))
         dfs.append(pd.read_csv(file))
 
+def get_metric_series(df, candidates):
+    for col in candidates:
+        if col in df.columns:
+            return df[col]
+    return None
+
+
 p_metrics = pd.DataFrame(columns=['Method'] + files)
-for m, label_csv in enumerate(labels_in_csv):
+for metric_name, candidates in metric_specs:
     for i, df_i in enumerate(dfs):
         p = dict()
+        series_i = get_metric_series(df_i, candidates)
         for j, df_j in enumerate(dfs):
             if df_i is not df_j:
-                result = ttest_rel(df_i[label_csv].values, df_j[label_csv].values)
-                # result = ttest_rel(df_i[label_csv][~df_i[label_csv].isnan()].values, df_j[label_csv][~df_i[label_csv].isna()].values)
-                p[files[j]] = np.format_float_scientific(result.statistic, 2) + ', ' + np.format_float_scientific(result.pvalue, 2)
+                series_j = get_metric_series(df_j, candidates)
+                if series_i is None or series_j is None:
+                    p[files[j]] = 'NA, NA'
+                else:
+                    result = ttest_rel(series_i.values, series_j.values)
+                    p[files[j]] = np.format_float_scientific(result.statistic, 2) + ', ' + np.format_float_scientific(result.pvalue, 2)
             else:
                 p[files[j]] = '0, 0'
-        p['Method'] = files[i] + ' ' + labels[m]
+        p['Method'] = files[i] + ' ' + metric_name
         p = pd.DataFrame(p, index=[files[i]])
         p_metrics = pd.concat([p_metrics, p])
 p_metrics.to_csv(f'{folder}/metrics/p_metrics.csv', index=False)
 
 
-metrics_csv = pd.DataFrame(columns=['Method'] + labels)
+metrics_csv = pd.DataFrame(columns=['Method'] + [m[0] for m in metric_specs] + [m[0] for m in optional_metric_specs])
 
 for i, df in enumerate(dfs):
     metrics = dict()
-    for j, label in enumerate(labels_in_csv):
-        if label == 'success_rate':
-            metrics[labels[j]] = (np.sum(df[label])/len(df[label])).round(3).astype('str') + ' (+- ' + np.nanstd(df[label]).round(3).astype('str') + ')'
+    for metric_name, candidates in metric_specs + optional_metric_specs:
+        series = get_metric_series(df, candidates)
+        if series is None:
+            metrics[metric_name] = 'NA'
+            continue
+        if candidates[0] == 'success_rate':
+            metrics[metric_name] = (np.sum(series) / len(series)).round(3).astype('str') + ' (+- ' + np.nanstd(series).round(3).astype('str') + ')'
         else:
-            metrics[labels[j]] = np.nanmean(df[label]).round(3).astype('str') + ' (+- ' + np.nanstd(df[label]).round(3).astype('str') + ')'
+            metrics[metric_name] = np.nanmean(series).round(3).astype('str') + ' (+- ' + np.nanstd(series).round(3).astype('str') + ')'
     metrics['Method'] = files[i]
     metrics = pd.DataFrame(metrics, index=[files[i]])
     metrics_csv = pd.concat([metrics_csv, metrics])
 metrics_csv.to_csv(f'{folder}/metrics/metrics.csv', index=False)
 
-for metrics, label in enumerate(['success_rate', 'makespan', 'time_cost', 'waiting_time', 'travel_dist', 'efficiency']):
+for metric_name, candidates in metric_specs:
     plt.figure(dpi=300)
     for id, df in enumerate(dfs):
-        plt.plot(df[label], label=files[id])
+        series = get_metric_series(df, candidates)
+        if series is None:
+            continue
+        plt.plot(series, label=files[id])
     plt.legend()
-    plt.title(labels[metrics])
-    plt.savefig(f'{folder}/metrics/{labels[metrics]}.png')
+    plt.title(metric_name)
+    plt.savefig(f'{folder}/metrics/{metric_name}.png')
     plt.close()
 
 # plot average results of all csv files in a folder and error bar
-for metrics, label in enumerate(['success_rate', 'makespan', 'time_cost', 'waiting_time', 'travel_dist', 'efficiency']):
+for metric_name, candidates in metric_specs + optional_metric_specs:
     plt.figure(dpi=300)
+    plotted = False
     for idx, df in enumerate(dfs):
+        series = get_metric_series(df, candidates)
+        if series is None:
+            continue
+        plotted = True
         # plot average and error bar
-        mean = np.nanmean(df[label])
-        std = np.nanstd(df[label])
-        min_ = np.min(df[label])
-        max_ = np.max(df[label])
+        mean = np.nanmean(series)
+        std = np.nanstd(series)
+        min_ = np.min(series)
+        max_ = np.max(series)
         plt.errorbar(idx, mean, std, fmt='b', lw=3, alpha=0.5)
         plt.errorbar(idx, mean, np.array([[np.round(mean - min_, 4)], [np.round(max_ - mean, 4)]]), fmt='.', lw=1, label=files[idx])
-        # plt.errorbar(idx, mean, np.array([[np.round(mean - min_, 4)], [np.round(max_ - mean, 4)]]), fmt='.', lw=1,
-        #             label=files[idx]+f' v={np.format_float_scientific(p[idx].statistic[metrics], 4)}  p={np.format_float_scientific(p[idx].pvalue[metrics], 4)}' if p[idx] is not None else files[idx])
+    if not plotted:
+        plt.close()
+        continue
     plt.legend(fontsize="7")
     plt.xticks([])
-    plt.title(labels[metrics])
-    plt.savefig(f'{folder}/metrics/{labels[metrics]} Average.png')
+    plt.title(metric_name)
+    plt.savefig(f'{folder}/metrics/{metric_name} Average.png')
     plt.close()

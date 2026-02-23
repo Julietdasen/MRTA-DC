@@ -152,9 +152,31 @@ def writeToTensorBoard(writer, tensorboardData, curr_episode, plotMeans=True):
     if plotMeans:
         tensorboardData = np.array(tensorboardData)
         tensorboardData = list(np.nanmean(tensorboardData, axis=0))
-        reward, valueLoss, policyLoss, entropy, gradNorm, success_rate, time_cost_makespan, time_cost, waiting, distance, effi = tensorboardData
     else:
-        reward, valueLoss, policyLoss, entropy, gradNorm, success_rate, time_cost_makespan, time_cost, waiting, distance, effi = tensorboardData
+        tensorboardData = list(tensorboardData)
+
+    reward = tensorboardData[0]
+    valueLoss = tensorboardData[1]
+    policyLoss = tensorboardData[2]
+    entropy = tensorboardData[3]
+    gradNorm = tensorboardData[4]
+    success_rate = tensorboardData[5]
+    time_cost_makespan = tensorboardData[6]
+    time_cost = tensorboardData[7]
+    waiting = tensorboardData[8]
+    distance = tensorboardData[9]
+    # New metrics (v0.2): utilization_exec/wait/travel + legacy efficiency alias.
+    if len(tensorboardData) >= 14:
+        util_exec = tensorboardData[10]
+        util_wait = tensorboardData[11]
+        util_travel = tensorboardData[12]
+        effi = tensorboardData[13]
+    else:
+        # Backward compatibility with old training data layout.
+        effi = tensorboardData[10]
+        util_exec = effi
+        util_wait = np.nan
+        util_travel = np.nan
 
     writer.add_scalar(tag='Losses/Policy Loss', scalar_value=policyLoss, global_step=curr_episode)
     writer.add_scalar(tag='Losses/Entropy', scalar_value=entropy, global_step=curr_episode)
@@ -167,6 +189,10 @@ def writeToTensorBoard(writer, tensorboardData, curr_episode, plotMeans=True):
     writer.add_scalar(tag='Perf/Time cost', scalar_value=time_cost, global_step=curr_episode)
     writer.add_scalar(tag='Perf/Waiting time', scalar_value=waiting, global_step=curr_episode)
     writer.add_scalar(tag='Perf/Traveling distance', scalar_value=distance, global_step=curr_episode)
+    writer.add_scalar(tag='Perf/Utilization Exec', scalar_value=util_exec, global_step=curr_episode)
+    writer.add_scalar(tag='Perf/Utilization Wait', scalar_value=util_wait, global_step=curr_episode)
+    writer.add_scalar(tag='Perf/Utilization Travel', scalar_value=util_travel, global_step=curr_episode)
+    # Backward-compatible tag kept for old dashboards.
     writer.add_scalar(tag='Perf/Waiting Efficiency', scalar_value=effi, global_step=curr_episode)
 
     if WANDB_LOG:
@@ -184,6 +210,9 @@ def writeToTensorBoard(writer, tensorboardData, curr_episode, plotMeans=True):
                 'Time Cost': time_cost,
                 'Waiting Time': waiting,
                 'Traveling Distance': distance,
+                'Utilization Exec': util_exec,
+                'Utilization Wait': util_wait,
+                'Utilization Travel': util_travel,
                 'Waiting Efficiency': effi,
             },
         }, step=curr_episode)
@@ -199,6 +228,9 @@ def writeToTensorBoard(writer, tensorboardData, curr_episode, plotMeans=True):
         'time_cost': float(time_cost),
         'waiting_time': float(waiting),
         'travel_dist': float(distance),
+        'utilization_exec': float(util_exec),
+        'utilization_wait': float(util_wait),
+        'utilization_travel': float(util_travel),
         'efficiency': float(effi),
     }
 
@@ -315,7 +347,17 @@ def main():
         jobList.append(meta_agent.job.remote(weights, baseline_weights, curr_episode, agents_num, tasks_num))
         curr_episode += 1
 
-    metric_name = ['success_rate', 'makespan', 'time_cost', 'waiting_time', 'travel_dist', 'efficiency']
+    metric_name = [
+        'success_rate',
+        'makespan',
+        'time_cost',
+        'waiting_time',
+        'travel_dist',
+        'utilization_exec',
+        'utilization_wait',
+        'utilization_travel',
+        'efficiency',
+    ]
     trainingData = []
     experience_buffer = [[] for _ in range(9)]
     test_set = np.random.randint(low=0, high=1e8, size=[256 // NUM_META_AGENT, NUM_META_AGENT])
@@ -395,7 +437,7 @@ def main():
                 lr_now = global_optimizer.state_dict()['param_groups'][0]['lr']
                 logger.info(
                     '[TRAIN] ep=%d lr=%.8f reward=%.4f success=%.4f makespan=%.4f time=%.4f wait=%.4f dist=%.4f '
-                    'eff=%.4f policy=%.4f entropy=%.4f grad=%.4f',
+                    'util_exec=%.4f util_wait=%.4f util_travel=%.4f eff=%.4f policy=%.4f entropy=%.4f grad=%.4f',
                     curr_episode,
                     lr_now,
                     summary['reward'],
@@ -404,6 +446,9 @@ def main():
                     summary['time_cost'],
                     summary['waiting_time'],
                     summary['travel_dist'],
+                    summary['utilization_exec'],
+                    summary['utilization_wait'],
+                    summary['utilization_travel'],
                     summary['efficiency'],
                     summary['policy_loss'],
                     summary['entropy'],

@@ -35,10 +35,13 @@ class TaskEnv:
         self.agents_num = len(self.agent_dic)
         self.coalition_matrix = np.zeros((self.agents_num, self.tasks_num))
         self.current_time = 0
+        self.last_update_time = 0
         self.dt = 0.1
+        self.eps = 1e-8
         self.max_waiting_time = 10
         self.finished = False
         self.force_wait = True
+        self.force_waiting = True
         self.reactive_planning = False
         self.visible_length = 0
 
@@ -96,10 +99,14 @@ class TaskEnv:
                            # Workload state: initialized from legacy task time.
                            'workload': float(tasks_time[i, :]),
                            'remaining_workload': float(tasks_time[i, :]),
+                           'state': 'UNSTARTED',
+                           'started': False,
                            'work_rate': 0.0,
                            'alpha': float(self.task_alpha),
                            'start_team_size': 0,
                            'mode_cost': 0.0,
+                           'active_members': [],
+                           'arrived_members': [],
                            'sum_waiting_time': 0,
                            'efficiency': 0,
                            'abandoned_agent': []}
@@ -123,7 +130,12 @@ class TaskEnv:
                             'angle': 0,
                             'returned': False,
                             'assigned': False,
-                            'pre_set_route': None}
+                            'pre_set_route': None,
+                            'state': 'IDLE_AT_DEPOT',
+                            'target_task_id': -1,
+                            'time_exec': 0.0,
+                            'time_wait': 0.0,
+                            'time_travel': 0.0}
         depot = {'location': depot[0, :],
                  'members': [],
                  'ID': -1}
@@ -140,12 +152,17 @@ class TaskEnv:
         self.agents_num = len(self.agent_dic)
         self.coalition_matrix = np.zeros((self.agents_num, self.tasks_num))
         self.current_time = 0
+        self.last_update_time = 0
         self.finished = False
         for task in self.task_dic.values():
             if 'workload' not in task:
                 task['workload'] = float(task['time'])
             if 'remaining_workload' not in task:
                 task['remaining_workload'] = float(task['workload'])
+            if 'state' not in task:
+                task['state'] = 'UNSTARTED'
+            if 'started' not in task:
+                task['started'] = False
             if 'work_rate' not in task:
                 task['work_rate'] = 0.0
             if 'alpha' not in task:
@@ -154,20 +171,40 @@ class TaskEnv:
                 task['start_team_size'] = 0
             if 'mode_cost' not in task:
                 task['mode_cost'] = 0.0
+            if 'active_members' not in task:
+                task['active_members'] = []
+            if 'arrived_members' not in task:
+                task['arrived_members'] = []
+            if 'abandoned_agent' not in task:
+                task['abandoned_agent'] = []
+        for agent in self.agent_dic.values():
+            if 'state' not in agent:
+                agent['state'] = 'IDLE_AT_DEPOT'
+            if 'target_task_id' not in agent:
+                agent['target_task_id'] = -1
+            if 'time_exec' not in agent:
+                agent['time_exec'] = 0.0
+            if 'time_wait' not in agent:
+                agent['time_wait'] = 0.0
+            if 'time_travel' not in agent:
+                agent['time_travel'] = 0.0
 
     def clear_decisions(self):
         for task in self.task_dic.values():
             task.update(members=[], cost=[], finished=False, status=task['requirements'],feasible_assignment=False,
                         time_start=0, time_finish=0, remaining_workload=float(task['workload']), work_rate=0.0,
                         alpha=float(task.get('alpha', self.task_alpha)), start_team_size=0, mode_cost=0.0,
+                        state='UNSTARTED', started=False, active_members=[], arrived_members=[],
                         sum_waiting_time=0, efficiency=0, abandoned_agent=[])
         for agent in self.agent_dic.values():
             agent.update(route=[], location=self.depot['location'], next_location=self.depot['location'],
                          next_decision=0, travel_time=0, travel_dist=0, arrival_time=[], assigned=False,
                          sum_waiting_time=0, working_condition=0, current_action_index=0,
-                         trajectory=[], angle=0, returned=False, pre_set_route=None, depot=self.depot['location'])
+                         trajectory=[], angle=0, returned=False, pre_set_route=None, depot=self.depot['location'],
+                         state='IDLE_AT_DEPOT', target_task_id=-1, time_exec=0.0, time_wait=0.0, time_travel=0.0)
         self.depot.update(members=[], ID=-1)
         self.current_time = 0
+        self.last_update_time = 0
         self.finished = False
 
     @staticmethod
@@ -241,7 +278,7 @@ class TaskEnv:
     def get_unfinished_tasks(self):
         unfinished_tasks = []
         for task in self.task_dic.values():
-            unfinished_tasks.append(task['feasible_assignment'] is False and np.any(task['status'] > 0))
+            unfinished_tasks.append(float(task['remaining_workload']) > self.eps and not task['finished'])
         return unfinished_tasks
 
     def get_arrival_time(self, agent_id, task_id):
@@ -249,97 +286,210 @@ class TaskEnv:
         arrival_for_task = np.where(np.array(self.agent_dic[agent_id]['route']) == task_id)[0][-1]
         return float(arrival_time[arrival_for_task])
 
+    def _arrived_to_task(self, agent_id, task_id):
+        agent = self.agent_dic[agent_id]
+        if not agent['route']:
+            return False
+        if agent['route'][-1] != task_id:
+            return False
+        return float(agent['arrival_time'][-1]) <= float(self.current_time) + self.eps
+
+    def _refresh_task_members(self):
+        for task in self.task_dic.values():
+            task_id = task['ID']
+            arrived_members = []
+            for agent in self.agent_dic.values():
+                if self._arrived_to_task(agent['ID'], task_id):
+                    arrived_members.append(agent['ID'])
+            task['arrived_members'] = arrived_members
+            task['members'] = arrived_members.copy()
+
+    def _predict_task_finish(self, task):
+        if task['work_rate'] <= self.eps:
+            return np.inf
+        return float(self.current_time + task['remaining_workload'] / task['work_rate'])
+
+    def advance_time(self, t_next):
+        dt = float(t_next - self.last_update_time)
+        if dt <= self.eps:
+            self.last_update_time = float(t_next)
+            return
+
+        for task in self.task_dic.values():
+            if task['finished']:
+                continue
+            active_members = task.get('active_members', [])
+            n_active = len(active_members)
+            if n_active <= 0:
+                continue
+            rate = float(task['alpha']) * self.coalition_efficiency(n_active)
+            if rate <= self.eps:
+                continue
+            remaining = float(task['remaining_workload'])
+            time_to_finish = remaining / rate
+            effective_dt = min(dt, time_to_finish)
+            task['remaining_workload'] = float(np.clip(remaining - rate * effective_dt, a_min=0.0, a_max=None))
+            task['mode_cost'] += float(self.mode_cost(n_active) * effective_dt)
+            task['work_rate'] = rate
+            if task['remaining_workload'] <= self.eps:
+                task['remaining_workload'] = 0.0
+                task['finished'] = True
+                task['feasible_assignment'] = True
+                task['state'] = 'FINISHED'
+                task['time_finish'] = float(self.last_update_time + effective_dt)
+
+        for agent in self.agent_dic.values():
+            state = agent.get('state', 'IDLE_AT_DEPOT')
+            if state == 'TRAVELING':
+                agent['time_travel'] += dt
+            elif state == 'WORKING':
+                agent['time_exec'] += dt
+            elif state == 'WAITING':
+                agent['time_wait'] += dt
+
+        self.last_update_time = float(t_next)
+
     def agent_update(self):
         for agent in self.agent_dic.values():
-            if len(agent['arrival_time']) > 0:
-                time_difference = agent['arrival_time'][-1] - self.current_time
-                agent['working_condition'] = time_difference
-                if agent['route'][-1] == -1:
-                    if self.reactive_planning:
-                        if np.all(self.get_matrix(self.task_dic, 'feasible_assignment')[:self.visible_length]):
+            if len(agent['arrival_time']) == 0:
+                agent['state'] = 'IDLE_AT_DEPOT'
+                agent['target_task_id'] = -1
+                if not np.all(self.get_matrix(self.task_dic, 'finished')):
+                    agent['next_decision'] = float(self.current_time)
+                else:
+                    agent['next_decision'] = np.nan
+                agent['working_condition'] = 0.0
+                continue
+
+            latest_arrival = float(agent['arrival_time'][-1])
+            target_task_id = int(agent['route'][-1])
+            agent['target_task_id'] = target_task_id
+
+            if latest_arrival > float(self.current_time) + self.eps:
+                agent['state'] = 'TRAVELING'
+                agent['assigned'] = False
+                agent['returned'] = False
+                agent['next_decision'] = latest_arrival
+                agent['working_condition'] = latest_arrival - float(self.current_time)
+                continue
+
+            if target_task_id == -1:
+                agent['state'] = 'IDLE_AT_DEPOT'
+                agent['assigned'] = False
+                if np.all(self.get_matrix(self.task_dic, 'finished')):
+                    agent['returned'] = True
+                    agent['next_decision'] = np.nan
+                elif self.reactive_planning:
+                    if np.all(self.get_matrix(self.task_dic, 'finished')[:self.visible_length]):
+                        agent['next_decision'] = np.nan
+                    else:
+                        if agent['pre_set_route'] is not None and not agent['pre_set_route']:
                             agent['next_decision'] = np.nan
                         else:
-                            if agent['pre_set_route'] is not None and not agent['pre_set_route']:
-                                agent['next_decision'] = np.nan
-                            else:
-                                next_action = agent['pre_set_route'][0]
-                                next_decision_time = (next_action - 1)//20 * 10
-                                agent['next_decision'] = np.max([self.get_arrival_time(agent['ID'], -1), next_decision_time, self.current_time])
-                                if agent['ID'] in self.depot['members']:
-                                    self.depot['members'].remove(agent['ID'])
-                    else:
-                        agent['next_decision'] = np.nan
+                            next_action = agent['pre_set_route'][0]
+                            next_decision_time = (next_action - 1) // 20 * 10
+                            agent['next_decision'] = np.max(
+                                [self.get_arrival_time(agent['ID'], -1), next_decision_time, self.current_time]
+                            )
+                            if agent['ID'] in self.depot['members']:
+                                self.depot['members'].remove(agent['ID'])
                 else:
-                    current_task = self.task_dic[agent['route'][-1]]
-                    if current_task['feasible_assignment']:
-                        if agent['ID'] in current_task['members']:
-                            agent['next_decision'] = float(current_task['time_finish'])
-                            if self.current_time >= float(current_task['time_start']):
-                                agent['assigned'] = True
-                        else:
-                            agent['next_decision'] = self.get_arrival_time(agent['ID'], current_task['ID']) + self.max_waiting_time
-                            agent['assigned'] = False
-                    else:
-                        agent['next_decision'] = self.get_arrival_time(agent['ID'], current_task['ID']) + \
-                                                 self.max_waiting_time
-                        agent['assigned'] = False
+                    agent['returned'] = False
+                    agent['next_decision'] = float(self.current_time)
+                agent['working_condition'] = 0.0
+                continue
 
+            current_task = self.task_dic[target_task_id]
+            if current_task['finished']:
+                agent['state'] = 'WAITING'
+                agent['assigned'] = False
+                agent['returned'] = False
+                agent['next_decision'] = float(self.current_time)
+            elif agent['ID'] in current_task.get('active_members', []):
+                agent['state'] = 'WORKING'
+                agent['assigned'] = True
+                agent['returned'] = False
+                predicted_finish = self._predict_task_finish(current_task)
+                periodic_replan = float(self.current_time + self.max_waiting_time)
+                agent['next_decision'] = float(min(predicted_finish, periodic_replan))
+            elif agent['ID'] in current_task.get('arrived_members', []):
+                agent['state'] = 'WAITING'
+                agent['assigned'] = False
+                agent['returned'] = False
+                waiting_deadline = float(self.get_arrival_time(agent['ID'], current_task['ID']) + self.max_waiting_time)
+                if self.current_time >= waiting_deadline - self.eps:
+                    agent['next_decision'] = float(self.current_time)
+                else:
+                    agent['next_decision'] = waiting_deadline
             else:
-                agent['working_condition'] = 0.
+                agent['state'] = 'TRAVELING'
+                agent['assigned'] = False
+                agent['returned'] = False
+                agent['next_decision'] = latest_arrival
+
+            if np.isnan(agent['next_decision']) or np.isinf(agent['next_decision']):
+                agent['working_condition'] = 0.0
+            else:
+                agent['working_condition'] = float(np.clip(agent['next_decision'] - self.current_time, a_min=0.0, a_max=None))
 
     def task_update(self):
-        f = []
-        # check each task status and whether it is finished
-        for task in self.task_dic.values():
-            if not task['feasible_assignment']:
-                abilities = len(task['members'])
-                arrival = np.array([self.get_arrival_time(member, task['ID']) for member in task['members']])
-                task['status'] = task['requirements'] - abilities  # update task status
-                # Agents will wait for the other agents to arrive
-                if task['status'] <= 0:
-                    if len(arrival) > 0 and np.max(arrival) - np.min(arrival) <= self.max_waiting_time:
-                        # Task starts when required teammates have all arrived in time.
-                        task['time_start'] = float(np.max(arrival, keepdims=True))
-                        task['start_team_size'] = abilities
-                        task['work_rate'] = task['alpha'] * self.coalition_efficiency(abilities)
-                        if task['work_rate'] <= 0:
-                            task['work_rate'] = 1e-6
-                        # Dynamic finish time from workload / work_rate.
-                        duration = float(task['workload'] / task['work_rate'])
-                        task['time_finish'] = float(task['time_start'] + duration)
-                        # Mode cost is integrated over execution duration.
-                        task['mode_cost'] = self.mode_cost(abilities) * duration
-                        task['feasible_assignment'] = True
-                        f.append(task['ID'])
-                    else:
-                        task['feasible_assignment'] = False
-                        infeasible_members = arrival <= np.max(arrival, keepdims=True) - self.max_waiting_time
-                        for member in np.array(task['members'])[infeasible_members]:
-                            task['members'].remove(member)
-                            task['abandoned_agent'].append(member)
-                else:
-                    task['feasible_assignment'] = False
-                    for member in task['members']:
-                        if self.current_time - self.get_arrival_time(member, task['ID']) >= self.max_waiting_time:
-                            task['members'].remove(member)
-                            task['abandoned_agent'].append(member)
-            else:
-                if self.current_time < task['time_start']:
-                    task['remaining_workload'] = float(task['workload'])
-                elif self.current_time >= task['time_finish']:
-                    task['finished'] = True
-                    task['remaining_workload'] = 0.0
-                else:
-                    # Continuous-time workload decay while the task is executing.
-                    elapsed = float(self.current_time - task['time_start'])
-                    task['remaining_workload'] = np.clip(task['workload'] - task['work_rate'] * elapsed, a_min=0, a_max=None)
+        finished_tasks = []
+        self.advance_time(self.current_time)
+        self._refresh_task_members()
 
-        # check depot status
-        depot = self.depot
-        for member in depot['members']:
-            if self.current_time >= self.get_arrival_time(member, -1) and np.all(self.get_matrix(self.task_dic, 'feasible_assignment')):
+        for task in self.task_dic.values():
+            was_finished = bool(task['finished'])
+            if float(task['remaining_workload']) <= self.eps:
+                task['remaining_workload'] = 0.0
+                task['finished'] = True
+                task['state'] = 'FINISHED'
+
+            arrived_members = task.get('arrived_members', [])
+            requirement = int(max(1, np.ceil(np.sum(task['requirements']))))
+            task['status'] = np.clip(task['requirements'] - len(arrived_members), a_min=0, a_max=None)
+
+            if task['finished']:
+                task['feasible_assignment'] = True
+                task['active_members'] = []
+                task['work_rate'] = 0.0
+                task['state'] = 'FINISHED'
+                if task['time_finish'] == 0:
+                    task['time_finish'] = float(self.current_time)
+                if not was_finished:
+                    finished_tasks.append(task['ID'])
+                continue
+
+            if len(arrived_members) >= requirement:
+                task['active_members'] = arrived_members.copy()
+                task['feasible_assignment'] = True
+                task['work_rate'] = float(task['alpha'] * self.coalition_efficiency(len(task['active_members'])))
+                if not task.get('started', False):
+                    task['started'] = True
+                    task['time_start'] = float(self.current_time)
+                    task['start_team_size'] = len(task['active_members'])
+                task['time_finish'] = self._predict_task_finish(task)
+                task['state'] = 'ACTIVE'
+            else:
+                task['active_members'] = []
+                task['feasible_assignment'] = False
+                task['work_rate'] = 0.0
+                task['time_finish'] = 0
+                if task.get('started', False) and float(task['remaining_workload']) > self.eps:
+                    task['state'] = 'PAUSED'
+                else:
+                    task['state'] = 'UNSTARTED'
+                for member in arrived_members:
+                    waited = self.current_time - self.get_arrival_time(member, task['ID'])
+                    if waited >= self.max_waiting_time and member not in task['abandoned_agent']:
+                        task['abandoned_agent'].append(member)
+                        self.agent_dic[member]['next_decision'] = float(self.current_time)
+
+        all_finished = bool(np.all(self.get_matrix(self.task_dic, 'finished')))
+        for member in self.depot['members']:
+            if self.current_time >= self.get_arrival_time(member, -1) and all_finished:
                 self.agent_dic[member]['returned'] = True
-        return f
+
+        return finished_tasks
 
     def next_decision(self):
         decision_time = np.array(self.get_matrix(self.agent_dic, 'next_decision'))
@@ -366,11 +516,26 @@ class TaskEnv:
         """
         #  choose any task
         task_id = task_id - 1
+        agent = self.agent_dic[agent_id]
+
+        # Leave current target/task immediately when replanning.
+        if agent['route']:
+            previous_target = int(agent['route'][-1])
+            if previous_target != -1 and previous_target in self.task_dic:
+                previous_task = self.task_dic[previous_target]
+                if agent_id in previous_task['members']:
+                    previous_task['members'].remove(agent_id)
+                if agent_id in previous_task.get('arrived_members', []):
+                    previous_task['arrived_members'].remove(agent_id)
+                if agent_id in previous_task.get('active_members', []):
+                    previous_task['active_members'].remove(agent_id)
+            elif previous_target == -1 and agent_id in self.depot['members']:
+                self.depot['members'].remove(agent_id)
+
         if task_id != -1:
-            agent = self.agent_dic[agent_id]
             task = self.task_dic[task_id]
+            agent['returned'] = False
         else:
-            agent = self.agent_dic[agent_id]
             task = self.depot
         agent['route'].append(task_id)
         travel_time = self.calculate_eulidean_distance(agent, task) / agent['velocity']
@@ -379,13 +544,18 @@ class TaskEnv:
         agent['arrival_time'] += [self.current_time + travel_time]
         # calculate the angle from current location to next location
         agent['location'] = task['location']
+        agent['target_task_id'] = task_id
+        agent['state'] = 'TRAVELING' if travel_time > self.eps else ('IDLE_AT_DEPOT' if task_id == -1 else 'WAITING')
         if agent_id not in task['members']:
             task['members'].append(agent_id)
 
         return - travel_time
 
     def step(self, group, leader_id, action, current_action_index=0):
-        vacancy = self.task_dic[action-1]['status'] if action-1 in self.task_dic.keys() else len(group)
+        if action - 1 in self.task_dic.keys():
+            vacancy = int(np.maximum(1, np.ceil(np.sum(self.task_dic[action - 1]['status']))))
+        else:
+            vacancy = len(group)
         group.remove(leader_id)
         available_agents = len(group)
         if vacancy > 1:
@@ -404,30 +574,19 @@ class TaskEnv:
 
     def calculate_waiting_time(self):
         for agent in self.agent_dic.values():
-            agent['sum_waiting_time'] = 0
+            agent['sum_waiting_time'] = float(agent.get('time_wait', 0.0))
         for task in self.task_dic.values():
-            arrival = np.array([self.get_arrival_time(member, task['ID']) for member in task['members']])
-            if len(arrival) != 0:
-                if task['feasible_assignment']:
-                    task['sum_waiting_time'] = np.sum(np.max(arrival) - arrival) \
-                                               + len(task['abandoned_agent']) * self.max_waiting_time
-                else:
-                    task['sum_waiting_time'] = np.sum(self.current_time - arrival) \
-                                               + len(task['abandoned_agent']) * self.max_waiting_time
-            else:
-                task['sum_waiting_time'] = len(task['abandoned_agent']) * self.max_waiting_time
-            for member in task['members']:
-                if task['feasible_assignment']:
-                    self.agent_dic[member]['sum_waiting_time'] += np.max(arrival) - self.get_arrival_time(member, task['ID'])
-                else:
-                    self.agent_dic[member]['sum_waiting_time'] += self.current_time - self.get_arrival_time(member, task['ID']) if self.current_time - self.get_arrival_time(member, task['ID']) > 0 else 0
-            for member in task['abandoned_agent']:
-                self.agent_dic[member]['sum_waiting_time'] += self.max_waiting_time
+            waiting = 0.0
+            for member in task.get('members', []):
+                waiting += float(self.agent_dic[member].get('time_wait', 0.0))
+            task['sum_waiting_time'] = waiting
 
     def check_finished(self):
         decision_agents, current_time = self.next_decision()
         if len(decision_agents) == 0:
             self.current_time = current_time
+            self.task_update()
+            self.agent_update()
             finished = np.all(self.get_matrix(self.agent_dic, 'returned')) and np.all(self.get_matrix(self.task_dic, 'finished'))
         else:
             finished = False
@@ -482,10 +641,7 @@ class TaskEnv:
         self.calculate_waiting_time()
         finished_tasks = self.get_matrix(self.task_dic, 'finished')
         total_waiting_time = float(np.sum(self.get_matrix(self.agent_dic, 'sum_waiting_time')))
-        total_travel_time = 0.0
-        for agent in self.agent_dic.values():
-            speed = float(agent['velocity']) if agent['velocity'] > 0 else 1.0
-            total_travel_time += float(agent['travel_dist']) / speed
+        total_travel_time = float(np.sum([agent.get('time_travel', 0.0) for agent in self.agent_dic.values()]))
         total_mode_cost = float(np.sum(self.get_matrix(self.task_dic, 'mode_cost')))
         # Terminal reward uses weighted sum per v0.1 spec.
         reward = - (
@@ -495,6 +651,16 @@ class TaskEnv:
             + self.reward_w_mode * total_mode_cost
         )
         return reward, finished_tasks
+
+    def get_utilization_metrics(self):
+        makespan = float(self.current_time)
+        if makespan <= self.eps:
+            return 0.0, 0.0, 0.0
+        denom = float(self.agents_num * makespan)
+        total_exec = float(np.sum([agent.get('time_exec', 0.0) for agent in self.agent_dic.values()]))
+        total_wait = float(np.sum([agent.get('time_wait', 0.0) for agent in self.agent_dic.values()]))
+        total_travel = float(np.sum([agent.get('time_travel', 0.0) for agent in self.agent_dic.values()]))
+        return total_exec / denom, total_wait / denom, total_travel / denom
 
     def stack_trajectory(self):
         for agent in self.agent_dic.values():

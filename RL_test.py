@@ -28,7 +28,17 @@ global_network = AttentionNet(AGENT_INPUT_DIM, TASK_INPUT_DIM, EMBEDDING_DIM).to
 checkpoint = torch.load(f'{model_path}/checkpoint.pth', map_location=torch.device('cpu'))
 global_network.load_state_dict(checkpoint['model'])
 worker = Worker(0, global_network, global_network, 0, device)
-perf_metrics = {'success_rate': [], 'makespan': [], 'time_cost':[], 'waiting_time': [], 'travel_dist': [], 'efficiency': []}
+perf_metrics = {
+    'success_rate': [],
+    'makespan': [],
+    'time_cost': [],
+    'waiting_time': [],
+    'travel_dist': [],
+    'utilization_exec': [],
+    'utilization_wait': [],
+    'utilization_travel': [],
+    'efficiency': [],
+}
 df = pd.DataFrame(perf_metrics)
 
 for i in range(0, 50):
@@ -49,4 +59,3 @@ for i in range(0, 50):
     df_ = pd.DataFrame(results, index=[i])
     df = pd.concat([df, df_])
 df.to_csv(f'{testSet}/REINFORCE_{METHOD}.csv')
-

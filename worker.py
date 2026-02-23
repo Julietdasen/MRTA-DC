@@ -120,7 +120,12 @@ class Worker:
         perf_metrics['time_cost'] = np.nanmean(self.env.get_matrix(self.env.task_dic, 'time_start'))
         perf_metrics['waiting_time'] = np.mean(self.env.get_matrix(self.env.agent_dic, 'sum_waiting_time'))
         perf_metrics['travel_dist'] = np.sum(self.env.get_matrix(self.env.agent_dic, 'travel_dist'))
-        perf_metrics['efficiency'] = np.mean(self.env.get_matrix(self.env.task_dic, 'sum_waiting_time'))
+        util_exec, util_wait, util_travel = self.env.get_utilization_metrics()
+        perf_metrics['utilization_exec'] = util_exec
+        perf_metrics['utilization_wait'] = util_wait
+        perf_metrics['utilization_travel'] = util_travel
+        # Backward-compatible alias kept for existing logs/scripts.
+        perf_metrics['efficiency'] = util_exec
         if self.save_image:
             self.env.plot_animation(gifs_path, episode_number)
         self.experience = episode_buffer
@@ -164,7 +169,11 @@ class Worker:
         perf_metrics['time_cost'] = np.nanmean(self.baseline_env.get_matrix(self.baseline_env.task_dic, 'time_start'))
         perf_metrics['waiting_time'] = np.mean(self.baseline_env.get_matrix(self.baseline_env.agent_dic, 'sum_waiting_time'))
         perf_metrics['travel_dist'] = np.sum(self.baseline_env.get_matrix(self.baseline_env.agent_dic, 'travel_dist'))
-        perf_metrics['efficiency'] = np.mean(self.baseline_env.get_matrix(self.baseline_env.task_dic, 'sum_waiting_time'))
+        util_exec, util_wait, util_travel = self.baseline_env.get_utilization_metrics()
+        perf_metrics['utilization_exec'] = util_exec
+        perf_metrics['utilization_wait'] = util_wait
+        perf_metrics['utilization_travel'] = util_travel
+        perf_metrics['efficiency'] = util_exec
         if image_path is not None:
             self.baseline_env.plot_animation(image_path, 'RL')
         # self.generate_route()
@@ -209,7 +218,11 @@ class Worker:
         perf_metrics['time_cost'] = np.nanmean(self.baseline_env.get_matrix(self.baseline_env.task_dic, 'time_start'))
         perf_metrics['waiting_time'] = np.mean(self.baseline_env.get_matrix(self.baseline_env.agent_dic, 'sum_waiting_time'))
         perf_metrics['travel_dist'] = np.sum(self.baseline_env.get_matrix(self.baseline_env.agent_dic, 'travel_dist'))
-        perf_metrics['efficiency'] = np.mean(self.baseline_env.get_matrix(self.baseline_env.task_dic, 'sum_waiting_time'))
+        util_exec, util_wait, util_travel = self.baseline_env.get_utilization_metrics()
+        perf_metrics['utilization_exec'] = util_exec
+        perf_metrics['utilization_wait'] = util_wait
+        perf_metrics['utilization_travel'] = util_travel
+        perf_metrics['efficiency'] = util_exec
         return perf_metrics
 
     def baseline_test(self):

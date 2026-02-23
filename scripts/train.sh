@@ -20,7 +20,7 @@ RESUME_CKPT="${RESUME_CKPT:-}"
 # -----------------------------
 # Build run name and directories
 # -----------------------------
-TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)" # 时间戳
 SAFE_TAG="$(echo "${RUN_TAG}" | tr ' ' '_' | tr -cd '[:alnum:]_.-')"
 SAFE_COMMENT="$(echo "${RUN_COMMENT}" | tr ' ' '_' | tr -cd '[:alnum:]_.-')"
 
@@ -32,12 +32,12 @@ if [[ -n "${SAFE_COMMENT}" ]]; then
   RUN_NAME="${RUN_NAME}_${SAFE_COMMENT}"
 fi
 
-RUN_DIR="${RUN_ROOT}/${RUN_NAME}"
-MODEL_DIR="${RUN_DIR}/model"
-TB_DIR="${RUN_DIR}/train/tb"
-GIF_DIR="${RUN_DIR}/artifacts/gifs"
-LOG_DIR="${RUN_DIR}/logs"
-CONFIG_DIR="${RUN_DIR}/config"
+RUN_DIR="${RUN_ROOT}/${RUN_NAME}" # 训练结果的根目录
+MODEL_DIR="${RUN_DIR}/model" #ckpt模型的保存目录
+TB_DIR="${RUN_DIR}/train/tb" # TensorBoard日志的保存目录
+GIF_DIR="${RUN_DIR}/artifacts/gifs" # 训练过程中生成的GIF动画的保存目录
+LOG_DIR="${RUN_DIR}/logs" # 训练日志的保存目录
+CONFIG_DIR="${RUN_DIR}/config" # 训练配置的保存目录
 
 mkdir -p "${MODEL_DIR}" "${TB_DIR}" "${GIF_DIR}" "${LOG_DIR}" "${CONFIG_DIR}"
 

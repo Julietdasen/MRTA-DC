@@ -29,7 +29,22 @@ class Worker:
         self.metaAgentID = mete_agent_id
         self.global_step = global_step
         self.save_image = save_image
-        self.env = TaskEnv(agents_num, tasks_num, TRAIT_DIM, COALITION_SIZE, seed=seed, plot_figure=save_image)
+        # Pass v0.1 dynamic-task parameters from central config.
+        self.env = TaskEnv(
+            agents_num,
+            tasks_num,
+            TRAIT_DIM,
+            COALITION_SIZE,
+            seed=seed,
+            plot_figure=save_image,
+            task_alpha=TASK_ALPHA,
+            coalition_beta=COALITION_BETA,
+            mode_cost_type=MODE_COST_TYPE,
+            reward_w_makespan=REWARD_W_MAKESPAN,
+            reward_w_travel=REWARD_W_TRAVEL,
+            reward_w_wait=REWARD_W_WAIT,
+            reward_w_mode=REWARD_W_MODE,
+        )
         self.baseline_env = copy.deepcopy(self.env)
         self.local_net = local_network
         self.local_baseline = local_baseline

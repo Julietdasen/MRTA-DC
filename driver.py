@@ -16,7 +16,8 @@ from parameters import *
 from env.task_env import TaskEnv
 from scipy.stats import ttest_rel
 
-ray.init()
+ray.init(num_gpus=NUM_GPU)
+print(f"Ray resources: {ray.cluster_resources()}")
 writer = SummaryWriter(train_path)
 if not os.path.exists(model_path):
     os.makedirs(model_path)
@@ -59,8 +60,10 @@ def writeToTensorBoard(writer, tensorboardData, curr_episode, plotMeans=True):
 
 
 def main():
-    device = torch.device('cuda') if USE_GPU_GLOBAL else torch.device('cpu')
-    local_device = torch.device('cuda') if USE_GPU else torch.device('cpu')
+    use_cuda_global = USE_GPU_GLOBAL and torch.cuda.is_available()
+    use_cuda_local = USE_GPU and torch.cuda.is_available()
+    device = torch.device('cuda') if use_cuda_global else torch.device('cpu')
+    local_device = torch.device('cuda') if use_cuda_local else torch.device('cpu')
 
     global_network = AttentionNet(AGENT_INPUT_DIM, TASK_INPUT_DIM, EMBEDDING_DIM).to(device)
     baseline_network = AttentionNet(AGENT_INPUT_DIM, TASK_INPUT_DIM, EMBEDDING_DIM).to(device)

@@ -14,7 +14,10 @@ class Runner(object):
 
     def __init__(self, metaAgentID):
         self.metaAgentID = metaAgentID
-        self.device = torch.device('cuda') if USE_GPU else torch.device('cpu')
+        use_cuda = USE_GPU and torch.cuda.is_available()
+        if USE_GPU and not use_cuda:
+            print("Warning: USE_GPU=True but CUDA not available; falling back to CPU")
+        self.device = torch.device('cuda') if use_cuda else torch.device('cpu')
         self.localNetwork = AttentionNet(AGENT_INPUT_DIM, TASK_INPUT_DIM, EMBEDDING_DIM)
         self.localNetwork.to(self.device)
         self.localBaseline = AttentionNet(AGENT_INPUT_DIM, TASK_INPUT_DIM, EMBEDDING_DIM)
@@ -71,7 +74,7 @@ class Runner(object):
         return jobResults, metrics, info
 
 
-@ray.remote(num_cpus=1, num_gpus=NUM_GPU / NUM_META_AGENT)
+@ray.remote(num_cpus=1, num_gpus=NUM_GPU / NUM_META_AGENT if (USE_GPU and torch.cuda.is_available()) else 0)
 class RLRunner(Runner):
     def __init__(self, metaAgentID):
         super().__init__(metaAgentID)

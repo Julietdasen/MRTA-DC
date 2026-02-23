@@ -1,4 +1,4 @@
-USE_GPU = False
+USE_GPU = True
 USE_GPU_GLOBAL = True
 NUM_GPU = 1
 NUM_META_AGENT = 8
@@ -17,6 +17,20 @@ TASKS_RANGE = (20, 50)
 COALITION_SIZE = 5
 MAX_TIME = 100
 TRAIT_DIM = 1
+
+# v0.1 dynamic coalition/task settings
+TASK_ALPHA = 1.0
+# Fixed beta for the first implementation (no sweep yet).
+COALITION_BETA = 0.8
+MODE_COST_TYPE = 'linear'  # 'linear' or 'quadratic'
+
+# v0.1 reward weights
+# Reward ratio follows: makespan : travel : wait : mode = 1.0 : 0.05 : 0.1 : 0.05
+REWARD_W_MAKESPAN = 1.0
+REWARD_W_TRAVEL = 0.05
+REWARD_W_WAIT = 0.1
+REWARD_W_MODE = 0.05
+
 FOLDER_NAME = 'REINFORCE'
 model_path = f'model/{FOLDER_NAME}'
 train_path = f'train/{FOLDER_NAME}'

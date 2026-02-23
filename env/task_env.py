@@ -7,7 +7,8 @@ from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 
 class TaskEnv:
     def __init__(self, agents_range=(10, 10), tasks_range=(10, 10), traits_dim=1, max_coalition_size=3, max_duration=5,
-                 seed=None, plot_figure=False):
+                 seed=None, plot_figure=False, task_alpha=1.0, coalition_beta=0.8, mode_cost_type='linear',
+                 reward_w_makespan=1.0, reward_w_travel=0.05, reward_w_wait=0.1, reward_w_mode=0.05):
         """
         :param traits_dim: number of capabilities in this problem, e.g. 3 traits
         :param seed: seed to generate pseudo random problem instance
@@ -18,6 +19,14 @@ class TaskEnv:
         self.max_coalition_size = max_coalition_size
         self.max_duration = max_duration
         self.plot_figure = plot_figure
+        # v0.1 model parameters (workload dynamics + reward shaping)
+        self.task_alpha = task_alpha
+        self.coalition_beta = coalition_beta
+        self.mode_cost_type = mode_cost_type
+        self.reward_w_makespan = reward_w_makespan
+        self.reward_w_travel = reward_w_travel
+        self.reward_w_wait = reward_w_wait
+        self.reward_w_mode = reward_w_mode
         if seed is not None:
             self.rng = np.random.default_rng(seed)
         self.traits_dim = traits_dim
@@ -84,6 +93,13 @@ class TaskEnv:
                            'time_finish': 0,
                            'status': tasks_ini[i, :],
                            'time': float(tasks_time[i, :]),
+                           # Workload state: initialized from legacy task time.
+                           'workload': float(tasks_time[i, :]),
+                           'remaining_workload': float(tasks_time[i, :]),
+                           'work_rate': 0.0,
+                           'alpha': float(self.task_alpha),
+                           'start_team_size': 0,
+                           'mode_cost': 0.0,
                            'sum_waiting_time': 0,
                            'efficiency': 0,
                            'abandoned_agent': []}
@@ -125,11 +141,26 @@ class TaskEnv:
         self.coalition_matrix = np.zeros((self.agents_num, self.tasks_num))
         self.current_time = 0
         self.finished = False
+        for task in self.task_dic.values():
+            if 'workload' not in task:
+                task['workload'] = float(task['time'])
+            if 'remaining_workload' not in task:
+                task['remaining_workload'] = float(task['workload'])
+            if 'work_rate' not in task:
+                task['work_rate'] = 0.0
+            if 'alpha' not in task:
+                task['alpha'] = float(self.task_alpha)
+            if 'start_team_size' not in task:
+                task['start_team_size'] = 0
+            if 'mode_cost' not in task:
+                task['mode_cost'] = 0.0
 
     def clear_decisions(self):
         for task in self.task_dic.values():
             task.update(members=[], cost=[], finished=False, status=task['requirements'],feasible_assignment=False,
-                        time_start=0, time_finish=0, sum_waiting_time=0, efficiency=0, abandoned_agent=[])
+                        time_start=0, time_finish=0, remaining_workload=float(task['workload']), work_rate=0.0,
+                        alpha=float(task.get('alpha', self.task_alpha)), start_team_size=0, mode_cost=0.0,
+                        sum_waiting_time=0, efficiency=0, abandoned_agent=[])
         for agent in self.agent_dic.values():
             agent.update(route=[], location=self.depot['location'], next_location=self.depot['location'],
                          next_decision=0, travel_time=0, travel_dist=0, arrival_time=[], assigned=False,
@@ -162,13 +193,27 @@ class TaskEnv:
     def calculate_eulidean_distance(agent, task):
         return np.linalg.norm(agent['location'] - task['location'])
 
+    def coalition_efficiency(self, n):
+        n = int(max(n, 0))
+        if n == 0:
+            return 0.0
+        # Saturating coalition gain: g(n)=n/(1+beta*(n-1))
+        return float(n / (1.0 + self.coalition_beta * (n - 1)))
+
+    def mode_cost(self, n):
+        n = int(max(n, 0))
+        if self.mode_cost_type == 'quadratic':
+            return float(n ** 2)
+        # Current default is linear mode cost h(n)=n.
+        return float(n)
+
     def get_current_agent_status(self, agent):
         status = []
         for a in self.agent_dic.values():
             if len(a['route']) > 0 and a['route'][-1] in self.task_dic.keys():
                 travel_time = np.clip(self.get_arrival_time(a['ID'], a['route'][-1]) - self.current_time, a_min=0, a_max=None)
                 current_waiting_time = np.clip(self.current_time - self.get_arrival_time(a['ID'], a['route'][-1]), a_min=0, a_max=None) if self.current_time <= self.task_dic[a['route'][-1]]['time_start'] else 0
-                remaining_working_time = np.clip(self.task_dic[a['route'][-1]]['time_start'] + self.task_dic[a['route'][-1]]['time'] - self.current_time, a_min=0, a_max=None) if self.current_time >= self.task_dic[a['route'][-1]]['time_start'] else 0
+                remaining_working_time = np.clip(self.task_dic[a['route'][-1]]['time_finish'] - self.current_time, a_min=0, a_max=None) if self.current_time >= self.task_dic[a['route'][-1]]['time_start'] else 0
             else:
                 travel_time = 0
                 current_waiting_time = 0
@@ -182,7 +227,7 @@ class TaskEnv:
     def get_current_task_status(self, agent):
         status = []
         for t in self.task_dic.values():
-            temp_status = np.hstack([t['status'], t['requirements'], t['time'],
+            temp_status = np.hstack([t['status'], t['requirements'], t['remaining_workload'],
                                      t['location'] - agent['location']])
             status.append(temp_status)
         status = [np.hstack([0, 0, 0, self.depot['location'] - agent['location']])] + status
@@ -252,9 +297,18 @@ class TaskEnv:
                 task['status'] = task['requirements'] - abilities  # update task status
                 # Agents will wait for the other agents to arrive
                 if task['status'] <= 0:
-                    if np.max(arrival) - np.min(arrival) <= self.max_waiting_time:
+                    if len(arrival) > 0 and np.max(arrival) - np.min(arrival) <= self.max_waiting_time:
+                        # Task starts when required teammates have all arrived in time.
                         task['time_start'] = float(np.max(arrival, keepdims=True))
-                        task['time_finish'] = float(np.max(arrival, keepdims=True) + task['time'])
+                        task['start_team_size'] = abilities
+                        task['work_rate'] = task['alpha'] * self.coalition_efficiency(abilities)
+                        if task['work_rate'] <= 0:
+                            task['work_rate'] = 1e-6
+                        # Dynamic finish time from workload / work_rate.
+                        duration = float(task['workload'] / task['work_rate'])
+                        task['time_finish'] = float(task['time_start'] + duration)
+                        # Mode cost is integrated over execution duration.
+                        task['mode_cost'] = self.mode_cost(abilities) * duration
                         task['feasible_assignment'] = True
                         f.append(task['ID'])
                     else:
@@ -270,8 +324,15 @@ class TaskEnv:
                             task['members'].remove(member)
                             task['abandoned_agent'].append(member)
             else:
-                if self.current_time >= task['time_finish']:
+                if self.current_time < task['time_start']:
+                    task['remaining_workload'] = float(task['workload'])
+                elif self.current_time >= task['time_finish']:
                     task['finished'] = True
+                    task['remaining_workload'] = 0.0
+                else:
+                    # Continuous-time workload decay while the task is executing.
+                    elapsed = float(self.current_time - task['time_start'])
+                    task['remaining_workload'] = np.clip(task['workload'] - task['work_rate'] * elapsed, a_min=0, a_max=None)
 
         # check depot status
         depot = self.depot
@@ -419,9 +480,20 @@ class TaskEnv:
 
     def get_episode_reward(self, max_time=100):
         self.calculate_waiting_time()
-        end = self.check_finished()
         finished_tasks = self.get_matrix(self.task_dic, 'finished')
-        reward = - self.current_time
+        total_waiting_time = float(np.sum(self.get_matrix(self.agent_dic, 'sum_waiting_time')))
+        total_travel_time = 0.0
+        for agent in self.agent_dic.values():
+            speed = float(agent['velocity']) if agent['velocity'] > 0 else 1.0
+            total_travel_time += float(agent['travel_dist']) / speed
+        total_mode_cost = float(np.sum(self.get_matrix(self.task_dic, 'mode_cost')))
+        # Terminal reward uses weighted sum per v0.1 spec.
+        reward = - (
+            self.reward_w_makespan * float(self.current_time)
+            + self.reward_w_travel * total_travel_time
+            + self.reward_w_wait * total_waiting_time
+            + self.reward_w_mode * total_mode_cost
+        )
         return reward, finished_tasks
 
     def stack_trajectory(self):
@@ -620,4 +692,3 @@ class TaskEnv:
             t = np.round(t, 1)
         pd = pd.DataFrame(time_tick_stamp)
         pd.to_csv(f'{path}time_RL.csv')
-

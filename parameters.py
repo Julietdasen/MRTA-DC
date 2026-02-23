@@ -1,3 +1,5 @@
+import os
+
 USE_GPU = True
 USE_GPU_GLOBAL = True
 NUM_GPU = 1
@@ -32,9 +34,9 @@ REWARD_W_WAIT = 0.1
 REWARD_W_MODE = 0.05
 
 FOLDER_NAME = 'REINFORCE'
-model_path = f'model/{FOLDER_NAME}'
-train_path = f'train/{FOLDER_NAME}'
-gifs_path = f'gifs/{FOLDER_NAME}'
+model_path = os.getenv('DCMRTA_MODEL_PATH', f'model/{FOLDER_NAME}')
+train_path = os.getenv('DCMRTA_TRAIN_PATH', f'train/{FOLDER_NAME}')
+gifs_path = os.getenv('DCMRTA_GIFS_PATH', f'gifs/{FOLDER_NAME}')
 LOAD_MODEL = False
 SAVE_IMG = True
 SAVE_IMG_GAP = 10000

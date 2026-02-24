@@ -3,6 +3,14 @@ import copy
 import json
 import logging
 import os
+
+_omp = os.environ.get('OMP_NUM_THREADS', '')
+try:
+    if int(_omp) < 1:
+        os.environ['OMP_NUM_THREADS'] = '1'
+except (ValueError, TypeError):
+    pass
+
 import random
 import socket
 import subprocess
@@ -18,30 +26,16 @@ from torch.utils.tensorboard import SummaryWriter
 
 import parameters as params
 from attention import AttentionNet
+from model.value_net import ValueNet
 from parameters import *
 from runner import RLRunner
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='DCMRTA trainer')
-    parser.add_argument('--tag', type=str, default=os.getenv('DCMRTA_RUN_TAG', ''),
-                        help='Optional run tag for logging.')
-    parser.add_argument('--comment', type=str, default=os.getenv('DCMRTA_RUN_COMMENT', ''),
-                        help='Optional run comment.')
+    parser.add_argument('--tag', type=str, default=os.getenv('DCMRTA_RUN_TAG', ''), help='Optional run tag for logging.')
+    parser.add_argument('--comment', type=str, default=os.getenv('DCMRTA_RUN_COMMENT', ''), help='Optional run comment.')
     return parser.parse_args()
-
-
-def sanitize_tag(text):
-    if not text:
-        return ''
-    allowed = []
-    for ch in text.strip():
-        if ch.isalnum() or ch in ['-', '_', '.']:
-            allowed.append(ch)
-        elif ch.isspace():
-            allowed.append('_')
-    compact = ''.join(allowed).strip('_.')
-    return compact[:80]
 
 
 def infer_run_dir():
@@ -148,91 +142,80 @@ def save_checkpoint(checkpoint, episode, best=False):
     return named
 
 
-def writeToTensorBoard(writer, tensorboardData, curr_episode, plotMeans=True):
-    if plotMeans:
-        tensorboardData = np.array(tensorboardData)
-        tensorboardData = list(np.nanmean(tensorboardData, axis=0))
-    else:
-        tensorboardData = list(tensorboardData)
+def entropy_coef_by_step(step):
+    if ENTROPY_DECAY_STEPS <= 0:
+        return ENTROPY_COEF_END
+    ratio = np.clip(step / float(ENTROPY_DECAY_STEPS), 0.0, 1.0)
+    return float(ENTROPY_COEF_START + (ENTROPY_COEF_END - ENTROPY_COEF_START) * ratio)
 
-    reward = tensorboardData[0]
-    valueLoss = tensorboardData[1]
-    policyLoss = tensorboardData[2]
-    entropy = tensorboardData[3]
-    gradNorm = tensorboardData[4]
-    success_rate = tensorboardData[5]
-    time_cost_makespan = tensorboardData[6]
-    time_cost = tensorboardData[7]
-    waiting = tensorboardData[8]
-    distance = tensorboardData[9]
-    # New metrics (v0.2): utilization_exec/wait/travel + legacy efficiency alias.
-    if len(tensorboardData) >= 14:
-        util_exec = tensorboardData[10]
-        util_wait = tensorboardData[11]
-        util_travel = tensorboardData[12]
-        effi = tensorboardData[13]
-    else:
-        # Backward compatibility with old training data layout.
-        effi = tensorboardData[10]
-        util_exec = effi
-        util_wait = np.nan
-        util_travel = np.nan
 
-    writer.add_scalar(tag='Losses/Policy Loss', scalar_value=policyLoss, global_step=curr_episode)
-    writer.add_scalar(tag='Losses/Entropy', scalar_value=entropy, global_step=curr_episode)
-    writer.add_scalar(tag='Losses/Grad Norm', scalar_value=gradNorm, global_step=curr_episode)
-    writer.add_scalar(tag='Losses/Value Loss', scalar_value=valueLoss, global_step=curr_episode)
+def explained_variance(y_pred, y_true):
+    var_y = float(torch.var(y_true, unbiased=False).item())
+    if var_y < 1e-8:
+        return 0.0
+    return float(1.0 - torch.var(y_true - y_pred, unbiased=False).item() / (var_y + 1e-8))
 
-    writer.add_scalar(tag='Perf/Reward', scalar_value=reward, global_step=curr_episode)
-    writer.add_scalar(tag='Perf/Makespan', scalar_value=time_cost_makespan, global_step=curr_episode)
-    writer.add_scalar(tag='Perf/Success rate', scalar_value=success_rate, global_step=curr_episode)
-    writer.add_scalar(tag='Perf/Time cost', scalar_value=time_cost, global_step=curr_episode)
-    writer.add_scalar(tag='Perf/Waiting time', scalar_value=waiting, global_step=curr_episode)
-    writer.add_scalar(tag='Perf/Traveling distance', scalar_value=distance, global_step=curr_episode)
-    writer.add_scalar(tag='Perf/Utilization Exec', scalar_value=util_exec, global_step=curr_episode)
-    writer.add_scalar(tag='Perf/Utilization Wait', scalar_value=util_wait, global_step=curr_episode)
-    writer.add_scalar(tag='Perf/Utilization Travel', scalar_value=util_travel, global_step=curr_episode)
-    # Backward-compatible tag kept for old dashboards.
-    writer.add_scalar(tag='Perf/Waiting Efficiency', scalar_value=effi, global_step=curr_episode)
+
+def merge_metrics(rows):
+    if not rows:
+        return {}
+    keys = sorted(rows[0].keys())
+    out = {}
+    for k in keys:
+        vals = [float(r.get(k, np.nan)) for r in rows]
+        out[k] = float(np.nanmean(vals))
+    return out
+
+
+def write_to_tensorboard(writer, train_rows, curr_episode):
+    summary = merge_metrics(train_rows)
+    writer.add_scalar('Losses/Policy Loss', summary.get('policy_loss', np.nan), curr_episode)
+    writer.add_scalar('Losses/Value Loss', summary.get('value_loss', np.nan), curr_episode)
+    writer.add_scalar('Losses/Entropy', summary.get('entropy', np.nan), curr_episode)
+    writer.add_scalar('Losses/Grad Norm', summary.get('grad_norm', np.nan), curr_episode)
+    writer.add_scalar('Losses/Adv Std', summary.get('adv_std', np.nan), curr_episode)
+    writer.add_scalar('Losses/Explained Variance', summary.get('explained_var', np.nan), curr_episode)
+
+    writer.add_scalar('Perf/Reward', summary.get('reward', np.nan), curr_episode)
+    writer.add_scalar('Perf/Makespan', summary.get('makespan', np.nan), curr_episode)
+    writer.add_scalar('Perf/Success rate', summary.get('success_rate', np.nan), curr_episode)
+    writer.add_scalar('Perf/Time cost', summary.get('time_cost', np.nan), curr_episode)
+    writer.add_scalar('Perf/Waiting time', summary.get('waiting_time', np.nan), curr_episode)
+    writer.add_scalar('Perf/Traveling distance', summary.get('travel_dist', np.nan), curr_episode)
+    writer.add_scalar('Perf/Utilization Exec', summary.get('utilization_exec', np.nan), curr_episode)
+    writer.add_scalar('Perf/Utilization Wait', summary.get('utilization_wait', np.nan), curr_episode)
+    writer.add_scalar('Perf/Utilization Travel', summary.get('utilization_travel', np.nan), curr_episode)
+    writer.add_scalar('Perf/Switch Rate', summary.get('switch_rate', np.nan), curr_episode)
+    writer.add_scalar('Perf/Quorum Break Rate', summary.get('quorum_break_rate', np.nan), curr_episode)
+    writer.add_scalar('Perf/Pause Events', summary.get('pause_events', np.nan), curr_episode)
+    writer.add_scalar('Perf/Waiting Efficiency', summary.get('efficiency', np.nan), curr_episode)
 
     if WANDB_LOG:
-        wandb.log({
-            'Losses': {
-                'Grad Norm': gradNorm,
-                'Policy Loss': policyLoss,
-                'Entropy': entropy,
-                'Value Loss': valueLoss,
-            },
-            'Perf': {
-                'Reward': reward,
-                'Makespan': time_cost_makespan,
-                'Success Rate': success_rate,
-                'Time Cost': time_cost,
-                'Waiting Time': waiting,
-                'Traveling Distance': distance,
-                'Utilization Exec': util_exec,
-                'Utilization Wait': util_wait,
-                'Utilization Travel': util_travel,
-                'Waiting Efficiency': effi,
-            },
-        }, step=curr_episode)
+        wandb.log({'train': summary}, step=curr_episode)
+    return summary
 
+
+def empty_experience_buffer():
     return {
-        'reward': float(reward),
-        'value_loss': float(valueLoss),
-        'policy_loss': float(policyLoss),
-        'entropy': float(entropy),
-        'grad_norm': float(gradNorm),
-        'success_rate': float(success_rate),
-        'makespan': float(time_cost_makespan),
-        'time_cost': float(time_cost),
-        'waiting_time': float(waiting),
-        'travel_dist': float(distance),
-        'utilization_exec': float(util_exec),
-        'utilization_wait': float(util_wait),
-        'utilization_travel': float(util_travel),
-        'efficiency': float(effi),
+        'agent_inputs': [],
+        'task_inputs': [],
+        'actions': [],
+        'masks': [],
+        'rewards': [],
+        'dones': [],
+        'values': [],
+        'global_feats': [],
+        'advantages': [],
+        'returns': [],
     }
+
+
+def take_batch(experience_buffer, batch_size):
+    rollouts = {}
+    for k, v in experience_buffer.items():
+        rollouts[k] = v[:batch_size]
+        experience_buffer[k] = v[batch_size:]
+    return rollouts
 
 
 def main():
@@ -242,9 +225,7 @@ def main():
 
     config_dir = os.path.join(run_dir, 'config')
     logs_dir = os.path.join(run_dir, 'logs')
-    train_dir = os.path.dirname(train_path)
-    if not train_dir:
-        train_dir = train_path
+    train_dir = os.path.dirname(train_path) or train_path
 
     for path in [run_dir, model_path, train_path, train_dir, gifs_path, config_dir, logs_dir]:
         os.makedirs(path, exist_ok=True)
@@ -272,11 +253,10 @@ def main():
     with open(os.path.join(logs_dir, 'env.log'), 'w', encoding='utf-8') as f:
         f.write(json.dumps(env_log, ensure_ascii=True, indent=2))
 
-    ray.init(num_gpus=NUM_GPU)
+    ray.init(num_gpus=NUM_GPU, runtime_env={'env_vars': {'OMP_NUM_THREADS': '1'}})
     logger.info('Ray resources: %s', ray.cluster_resources())
 
     writer = SummaryWriter(train_path)
-
     if WANDB_LOG:
         wandb.init(project='CF', name=run_name)
 
@@ -290,15 +270,19 @@ def main():
 
     global_network = AttentionNet(AGENT_INPUT_DIM, TASK_INPUT_DIM, EMBEDDING_DIM).to(device)
     baseline_network = AttentionNet(AGENT_INPUT_DIM, TASK_INPUT_DIM, EMBEDDING_DIM).to(device)
+    value_network = ValueNet(CRITIC_INPUT_DIM, CRITIC_HIDDEN_DIM).to(device)
+
     global_optimizer = optim.Adam(global_network.parameters(), lr=LR)
+    value_optimizer = optim.Adam(value_network.parameters(), lr=LR)
     lr_decay = optim.lr_scheduler.StepLR(global_optimizer, step_size=DECAY_STEP, gamma=0.98)
 
     if WANDB_LOG:
         wandb.watch(global_network)
 
     curr_episode = 0
-    best_perf = -100
     curr_level = 0
+    best_perf = -100.0
+    update_step = 0
 
     if LOAD_MODEL or os.getenv('DCMRTA_RESUME_CKPT', ''):
         resume_checkpoint = find_resume_checkpoint()
@@ -306,45 +290,42 @@ def main():
             logger.info('Loading model from %s', resume_checkpoint)
             checkpoint = torch.load(resume_checkpoint, map_location=device)
             global_network.load_state_dict(checkpoint['model'])
-            baseline_network.load_state_dict(checkpoint['model'])
-            global_optimizer.load_state_dict(checkpoint['optimizer'])
-            lr_decay.load_state_dict(checkpoint['lr_decay'])
+            baseline_network.load_state_dict(checkpoint.get('baseline_model', checkpoint['model']))
+            if 'value_model' in checkpoint:
+                value_network.load_state_dict(checkpoint['value_model'])
+            if 'optimizer' in checkpoint:
+                global_optimizer.load_state_dict(checkpoint['optimizer'])
+            if 'value_optimizer' in checkpoint:
+                value_optimizer.load_state_dict(checkpoint['value_optimizer'])
+            if 'lr_decay' in checkpoint:
+                lr_decay.load_state_dict(checkpoint['lr_decay'])
             curr_episode = checkpoint.get('episode', 0)
             curr_level = checkpoint.get('level', 0)
             best_perf = checkpoint.get('best_perf', best_perf)
+            update_step = checkpoint.get('update_step', 0)
             logger.info('Resumed | episode=%s | best_perf=%.6f', curr_episode, best_perf)
-
-            best_latest = os.path.join(model_path, 'best_model_checkpoint.pth')
-            if os.path.exists(best_latest):
-                best_model_checkpoint = torch.load(best_latest, map_location=device)
-                best_perf = best_model_checkpoint.get('best_perf', best_perf)
-                baseline_network.load_state_dict(best_model_checkpoint['model'])
-                logger.info('Best performance loaded: %.6f', best_perf)
-
-            if RESET_OPT:
-                global_optimizer = optim.Adam(global_network.parameters(), lr=LR)
-                lr_decay = optim.lr_scheduler.StepLR(global_optimizer, step_size=DECAY_STEP, gamma=0.98)
-                curr_episode = 0
-                logger.info('Optimizer reset and episode reset to 0')
         else:
-            logger.warning('LOAD_MODEL is enabled but no checkpoint file found under %s', model_path)
+            logger.warning('LOAD_MODEL enabled but no checkpoint found under %s', model_path)
 
     meta_agents = [RLRunner.remote(i) for i in range(NUM_META_AGENT)]
 
     if device != local_device:
         weights = global_network.to(local_device).state_dict()
         baseline_weights = baseline_network.to(local_device).state_dict()
+        value_weights = value_network.to(local_device).state_dict()
         global_network.to(device)
         baseline_network.to(device)
+        value_network.to(device)
     else:
         weights = global_network.state_dict()
         baseline_weights = baseline_network.state_dict()
+        value_weights = value_network.state_dict()
 
     jobList = []
     agents_num = np.random.randint(AGENTS_RANGE[0], AGENTS_RANGE[1] + 1)
     tasks_num = np.random.randint(TASKS_RANGE[0], TASKS_RANGE[1] + 1)
-    for _, meta_agent in enumerate(meta_agents):
-        jobList.append(meta_agent.job.remote(weights, baseline_weights, curr_episode, agents_num, tasks_num))
+    for meta_agent in meta_agents:
+        jobList.append(meta_agent.job.remote(weights, baseline_weights, value_weights, curr_episode, agents_num, tasks_num))
         curr_episode += 1
 
     metric_name = [
@@ -357,9 +338,12 @@ def main():
         'utilization_wait',
         'utilization_travel',
         'efficiency',
+        'switch_rate',
+        'quorum_break_rate',
+        'pause_events',
     ]
-    trainingData = []
-    experience_buffer = [[] for _ in range(9)]
+    training_rows = []
+    experience_buffer = empty_experience_buffer()
     test_set = np.random.randint(low=0, high=1e8, size=[256 // NUM_META_AGENT, NUM_META_AGENT])
     baseline_value = None
 
@@ -371,88 +355,137 @@ def main():
 
             perf_metrics = {name: [] for name in metric_name}
             for job in done_jobs:
-                jobResults, metrics, info = job
-                for i in range(9):
-                    experience_buffer[i] += jobResults[i]
+                job_results, metrics, info = job
+                for k in experience_buffer.keys():
+                    experience_buffer[k] += job_results[k]
                 for n in metric_name:
-                    perf_metrics[n].append(metrics[n])
+                    perf_metrics[n].append(float(metrics.get(n, np.nan)))
 
             update_done = False
-            while len(experience_buffer[0]) >= BATCH_SIZE:
-                agents_num = np.random.randint(AGENTS_RANGE[0], AGENTS_RANGE[1] + 1)
-                tasks_num = np.random.randint(TASKS_RANGE[0], TASKS_RANGE[1] + 1)
-                rollouts = copy.copy(experience_buffer)
-                for i in range(len(rollouts)):
-                    rollouts[i] = rollouts[i][:BATCH_SIZE]
-                for i in range(len(experience_buffer)):
-                    experience_buffer[i] = experience_buffer[i][BATCH_SIZE:]
-                if len(experience_buffer[0]) < BATCH_SIZE:
+            while len(experience_buffer['agent_inputs']) >= BATCH_SIZE:
+                rollouts = take_batch(experience_buffer, BATCH_SIZE)
+                if len(experience_buffer['agent_inputs']) < BATCH_SIZE:
                     update_done = True
-                if update_done:
-                    experience_buffer = [[] for _ in range(9)]
+                    experience_buffer = empty_experience_buffer()
 
-                agent_inputs = torch.stack(rollouts[0], dim=0)
-                task_inputs = torch.stack(rollouts[1], dim=0)
-                action_batch = torch.stack(rollouts[2], dim=0)
-                mask_batch = torch.stack(rollouts[3], dim=0)
-                advantage_batch = torch.stack(rollouts[6], dim=0)
-                reward_batch = torch.stack(rollouts[4], dim=0)
+                agent_inputs = torch.stack(rollouts['agent_inputs'], dim=0)
+                task_inputs = torch.stack(rollouts['task_inputs'], dim=0)
+                action_batch = torch.stack(rollouts['actions'], dim=0)
+                mask_batch = torch.stack(rollouts['masks'], dim=0)
+                advantage_batch = torch.stack(rollouts['advantages'], dim=0)
+                return_batch = torch.stack(rollouts['returns'], dim=0)
+                global_feat_batch = torch.stack(rollouts['global_feats'], dim=0)
+                reward_batch = torch.stack(rollouts['rewards'], dim=0)
+
+                if agent_inputs.dim() == 4 and agent_inputs.shape[1] == 1:
+                    agent_inputs = agent_inputs.squeeze(1)
+                if task_inputs.dim() == 4 and task_inputs.shape[1] == 1:
+                    task_inputs = task_inputs.squeeze(1)
+                if mask_batch.dim() == 3 and mask_batch.shape[1] == 1:
+                    mask_batch = mask_batch.squeeze(1)
+                if global_feat_batch.dim() == 3 and global_feat_batch.shape[1] == 1:
+                    global_feat_batch = global_feat_batch.squeeze(1)
+                if action_batch.dim() == 3 and action_batch.shape[1] == 1:
+                    action_batch = action_batch.squeeze(1)
+                if advantage_batch.dim() == 3 and advantage_batch.shape[1] == 1:
+                    advantage_batch = advantage_batch.squeeze(1)
+                if return_batch.dim() == 3 and return_batch.shape[1] == 1:
+                    return_batch = return_batch.squeeze(1)
+                if reward_batch.dim() == 3 and reward_batch.shape[1] == 1:
+                    reward_batch = reward_batch.squeeze(1)
 
                 if device != local_device:
                     agent_inputs = agent_inputs.to(device)
                     task_inputs = task_inputs.to(device)
                     action_batch = action_batch.to(device)
                     mask_batch = mask_batch.to(device)
-                    reward_batch = reward_batch.to(device)
                     advantage_batch = advantage_batch.to(device)
+                    return_batch = return_batch.to(device)
+                    global_feat_batch = global_feat_batch.to(device)
+                    reward_batch = reward_batch.to(device)
+
+                adv_mean = advantage_batch.mean()
+                adv_std = advantage_batch.std(unbiased=False)
+                norm_adv = (advantage_batch - adv_mean) / (adv_std + 1e-8)
+                norm_adv = torch.clamp(norm_adv, min=-5.0, max=5.0)
 
                 logp_list = global_network(task_inputs, agent_inputs, mask_batch)
-                logp = torch.gather(logp_list, 1, action_batch)
-                entropy = (logp_list * logp_list.exp()).nansum(dim=-1).mean()
-                policy_loss = (-logp * advantage_batch.detach()).mean()
+                logp = torch.gather(logp_list, 1, action_batch.long())
+                entropy = -(logp_list.exp() * logp_list).nansum(dim=-1).mean()
+                policy_loss = (-logp * norm_adv.detach()).mean()
+
+                value_pred = value_network(global_feat_batch)
+                value_loss = torch.nn.functional.mse_loss(value_pred, return_batch)
+                ent_coef = entropy_coef_by_step(update_step)
+                total_loss = policy_loss + VALUE_COEF * value_loss - ent_coef * entropy
 
                 global_optimizer.zero_grad()
-                policy_loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(global_network.parameters(), max_norm=10, norm_type=2)
+                value_optimizer.zero_grad()
+                total_loss.backward()
+                grad_norm_actor = torch.nn.utils.clip_grad_norm_(global_network.parameters(), max_norm=MAX_GRAD_NORM, norm_type=2)
+                grad_norm_value = torch.nn.utils.clip_grad_norm_(value_network.parameters(), max_norm=MAX_GRAD_NORM, norm_type=2)
                 global_optimizer.step()
+                value_optimizer.step()
                 lr_decay.step()
+                update_step += 1
 
-                perf_data = [np.nanmean(perf_metrics[n]) for n in metric_name]
-                data = [
-                    reward_batch.mean().item(),
-                    0,
-                    policy_loss.item(),
-                    entropy.item(),
-                    grad_norm.item(),
-                    *perf_data,
-                ]
-                trainingData.append(data)
+                ev = explained_variance(value_pred.detach(), return_batch.detach())
+                perf_data = {n: float(np.nanmean(perf_metrics[n])) for n in metric_name}
+                training_rows.append({
+                    'reward': float(reward_batch.mean().item()),
+                    'value_loss': float(value_loss.item()),
+                    'policy_loss': float(policy_loss.item()),
+                    'entropy': float(entropy.item()),
+                    'grad_norm': float(max(grad_norm_actor.item(), grad_norm_value.item())),
+                    'adv_std': float(adv_std.item()),
+                    'explained_var': float(ev),
+                    **perf_data,
+                })
 
-            for _, meta_agent in enumerate(meta_agents):
-                jobList.append(meta_agent.job.remote(weights, baseline_weights, curr_episode, agents_num, tasks_num))
+            if update_done:
+                if device != local_device:
+                    weights = global_network.to(local_device).state_dict()
+                    baseline_weights = baseline_network.to(local_device).state_dict()
+                    value_weights = value_network.to(local_device).state_dict()
+                    global_network.to(device)
+                    baseline_network.to(device)
+                    value_network.to(device)
+                else:
+                    weights = global_network.state_dict()
+                    baseline_weights = baseline_network.state_dict()
+                    value_weights = value_network.state_dict()
+
+            for meta_agent in meta_agents:
+                jobList.append(meta_agent.job.remote(weights, baseline_weights, value_weights, curr_episode, agents_num, tasks_num))
                 curr_episode += 1
 
-            if len(trainingData) >= SUMMARY_WINDOW:
-                summary = writeToTensorBoard(writer, trainingData, curr_episode)
+            if len(training_rows) >= SUMMARY_WINDOW:
+                summary = write_to_tensorboard(writer, training_rows, curr_episode)
                 lr_now = global_optimizer.state_dict()['param_groups'][0]['lr']
                 logger.info(
                     '[TRAIN] ep=%d lr=%.8f reward=%.4f success=%.4f makespan=%.4f time=%.4f wait=%.4f dist=%.4f '
-                    'util_exec=%.4f util_wait=%.4f util_travel=%.4f eff=%.4f policy=%.4f entropy=%.4f grad=%.4f',
+                    'util_exec=%.4f util_wait=%.4f util_travel=%.4f switch=%.4f quorum=%.4f pause=%.2f '
+                    'policy=%.4f value=%.4f entropy=%.4f adv_std=%.4f ev=%.4f grad=%.4f',
                     curr_episode,
                     lr_now,
-                    summary['reward'],
-                    summary['success_rate'],
-                    summary['makespan'],
-                    summary['time_cost'],
-                    summary['waiting_time'],
-                    summary['travel_dist'],
-                    summary['utilization_exec'],
-                    summary['utilization_wait'],
-                    summary['utilization_travel'],
-                    summary['efficiency'],
-                    summary['policy_loss'],
-                    summary['entropy'],
-                    summary['grad_norm'],
+                    summary.get('reward', np.nan),
+                    summary.get('success_rate', np.nan),
+                    summary.get('makespan', np.nan),
+                    summary.get('time_cost', np.nan),
+                    summary.get('waiting_time', np.nan),
+                    summary.get('travel_dist', np.nan),
+                    summary.get('utilization_exec', np.nan),
+                    summary.get('utilization_wait', np.nan),
+                    summary.get('utilization_travel', np.nan),
+                    summary.get('switch_rate', np.nan),
+                    summary.get('quorum_break_rate', np.nan),
+                    summary.get('pause_events', np.nan),
+                    summary.get('policy_loss', np.nan),
+                    summary.get('value_loss', np.nan),
+                    summary.get('entropy', np.nan),
+                    summary.get('adv_std', np.nan),
+                    summary.get('explained_var', np.nan),
+                    summary.get('grad_norm', np.nan),
                 )
                 append_jsonl(train_metrics_jsonl, {
                     'timestamp': datetime.now().isoformat(timespec='seconds'),
@@ -460,27 +493,21 @@ def main():
                     'lr': float(lr_now),
                     **summary,
                 })
-                trainingData = []
-
-            if update_done:
-                if device != local_device:
-                    weights = global_network.to(local_device).state_dict()
-                    baseline_weights = baseline_network.to(local_device).state_dict()
-                    global_network.to(device)
-                    baseline_network.to(device)
-                else:
-                    weights = global_network.state_dict()
-                    baseline_weights = baseline_network.state_dict()
+                training_rows = []
 
             if curr_episode % 512 == 0:
                 checkpoint = {
                     'model': global_network.state_dict(),
+                    'baseline_model': baseline_network.state_dict(),
+                    'value_model': value_network.state_dict(),
                     'optimizer': global_optimizer.state_dict(),
+                    'value_optimizer': value_optimizer.state_dict(),
                     'episode': curr_episode,
                     'lr_decay': lr_decay.state_dict(),
                     'level': curr_level,
                     'best_perf': best_perf,
                     'run_name': run_name,
+                    'update_step': update_step,
                 }
                 ckpt_path = save_checkpoint(checkpoint, curr_episode, best=False)
                 logger.info('[CHECKPOINT] saved %s', ckpt_path)
@@ -490,12 +517,11 @@ def main():
                 for actor in meta_agents:
                     ray.kill(actor)
                 torch.cuda.empty_cache()
-
                 logger.info('[EVAL] start ep=%d', curr_episode)
 
                 if baseline_value is None:
                     test_agent_list = [RLRunner.remote(metaAgentID=i) for i in range(NUM_META_AGENT)]
-                    for _, test_agent in enumerate(test_agent_list):
+                    for test_agent in test_agent_list:
                         ray.get(test_agent.set_baseline_weights.remote(baseline_weights))
                     rewards = []
                     for i in range(256 // NUM_META_AGENT):
@@ -509,7 +535,7 @@ def main():
                         ray.kill(actor)
 
                 test_agent_list = [RLRunner.remote(metaAgentID=i) for i in range(NUM_META_AGENT)]
-                for _, test_agent in enumerate(test_agent_list):
+                for test_agent in test_agent_list:
                     ray.get(test_agent.set_baseline_weights.remote(weights))
                 rewards = []
                 for i in range(256 // NUM_META_AGENT):
@@ -545,11 +571,15 @@ def main():
                         best_perf = test_mean
                         checkpoint = {
                             'model': global_network.state_dict(),
+                            'baseline_model': baseline_network.state_dict(),
+                            'value_model': value_network.state_dict(),
                             'optimizer': global_optimizer.state_dict(),
+                            'value_optimizer': value_optimizer.state_dict(),
                             'episode': curr_episode,
                             'lr_decay': lr_decay.state_dict(),
                             'best_perf': best_perf,
                             'run_name': run_name,
+                            'update_step': update_step,
                         }
                         best_path = save_checkpoint(checkpoint, curr_episode, best=True)
                         logger.info('[BEST] updated best model %s', best_path)
@@ -573,9 +603,21 @@ def main():
                     'best_perf': float(best_perf),
                 })
 
+                if device != local_device:
+                    weights = global_network.to(local_device).state_dict()
+                    baseline_weights = baseline_network.to(local_device).state_dict()
+                    value_weights = value_network.to(local_device).state_dict()
+                    global_network.to(device)
+                    baseline_network.to(device)
+                    value_network.to(device)
+                else:
+                    weights = global_network.state_dict()
+                    baseline_weights = baseline_network.state_dict()
+                    value_weights = value_network.state_dict()
+
                 jobList = []
-                for _, meta_agent in enumerate(meta_agents):
-                    jobList.append(meta_agent.job.remote(weights, baseline_weights, curr_episode, agents_num, tasks_num))
+                for meta_agent in meta_agents:
+                    jobList.append(meta_agent.job.remote(weights, baseline_weights, value_weights, curr_episode, agents_num, tasks_num))
                     curr_episode += 1
 
     except KeyboardInterrupt:

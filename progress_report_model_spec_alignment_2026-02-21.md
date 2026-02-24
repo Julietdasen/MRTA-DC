@@ -356,3 +356,83 @@
 
 - “同执行环境 + 同评测参数 + 同输出接口” 已完成；
 - “同优化目标语义（动态 workload 在线协同）” 尚未完成，属于后续深度对齐阶段。
+
+## 13. 2026-02-24 v0.3 基础改进（振荡与信用分配）实施记录
+
+### 13.1 会话目标与冻结决策
+
+用户在本轮明确：
+
+1. 先做基础改进，不改上下层 pipeline。  
+2. 振荡与信用分配是主要矛盾，不走“单纯增大模型”路线。  
+3. 接受 `轻量 Critic + GAE`。  
+4. 约束策略采用“软硬混合 + 中等硬约束”。  
+
+### 13.2 已落地代码
+
+本轮已改动：
+
+- `parameters.py`
+- `env/task_env.py`
+- `model/value_net.py`（新增）
+- `worker.py`
+- `runner.py`
+- `driver.py`
+- `scripts/p2_regression_suite.py`
+- `RL_test.py`（构造函数兼容调整）
+- `model_spec_mrta_dynamic_coalition_v0_3_design.md`（新增）
+
+### 13.3 环境层（v0.3）已实现内容
+
+1. 新增硬约束接口：`get_action_mask(agent_id)`  
+   - commit lock（最短驻留）  
+   - quorum protect（避免离开导致配额破坏）  
+
+2. 新增事件级奖励接口：`get_dense_reward_delta(reset=True)`  
+   - 支持 `Δtime/Δtravel/Δwait/Δmode`  
+   - 支持 switch / quorum-break / pause 软惩罚  
+   - 支持 potential shaping  
+
+3. 新增 critic 特征接口：`get_global_features()`（16 维）  
+
+4. 新增行为指标接口：`get_behavior_metrics()`  
+   - `switch_rate`, `quorum_break_rate`, `pause_events`  
+
+5. 扩展 agent/task 状态字段：  
+   - agent: `commit_task_id`, `commit_until`, `last_task_id`, `switch_count`  
+   - task: `pause_events`, `quorum_break_events`  
+
+### 13.4 训练层（v0.3）已实现内容
+
+1. 新增 `ValueNet`（`model/value_net.py`）。  
+2. `worker.py` 改为事件级轨迹采样，回传 `rewards/dones/values/global_feats` 与 `advantages/returns`。  
+3. `driver.py` 新增 actor-critic 优化：
+   - `policy_loss + VALUE_COEF * value_loss - entropy_coef * entropy`
+   - 优势标准化 + 裁剪
+   - entropy 线性衰减
+   - 新日志指标：`switch_rate`, `quorum_break_rate`, `pause_events`, `adv_std`, `value_loss`, `explained_var`
+4. `runner.py` 的分布式 job 接口增加 `value_weights` 下发。  
+
+### 13.5 回归工具更新
+
+`scripts/p2_regression_suite.py` 已补充 v0.3 行为指标输出与 CSV 对照：
+
+- `switch_rate`
+- `quorum_break_rate`
+- `pause_events`
+
+### 13.6 兼容与注意事项
+
+1. 本轮未触碰 OR-Tools / CTAS-D 语义，仅保持评测接口兼容。  
+2. `RL_test.py` 已按新 `Worker` 构造函数兼容。  
+3. v0.3 目标是先稳定训练信号与行为，不等价于最终上下层协同方案。  
+
+### 13.7 新会话接续锚点
+
+- 设计文档：`model_spec_mrta_dynamic_coalition_v0_3_design.md`  
+- 主实现文件：`env/task_env.py`, `worker.py`, `driver.py`, `runner.py`  
+- 回归入口：`scripts/p2_regression_suite.py`  
+- 下一步优先事项：
+  1. 运行短训（建议 20k episode）验证新指标是否达标。  
+  2. 按结果微调 `SWITCH_PENALTY / QUORUM_BREAK_PENALTY / MIN_COMMIT_TIME`。  
+  3. 达标后再进入 v0.4 上下层接口融合。  

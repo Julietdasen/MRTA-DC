@@ -2,7 +2,16 @@ import torch
 import numpy as np
 import ray
 import os
+
+# Fix: libgomp rejects OMP_NUM_THREADS=0; ensure it is a valid positive integer
+_omp = os.environ.get('OMP_NUM_THREADS', '')
+try:
+    if int(_omp) < 1:
+        os.environ['OMP_NUM_THREADS'] = '1'
+except (ValueError, TypeError):
+    pass
 from attention import AttentionNet
+from model.value_net import ValueNet
 from worker import Worker
 from parameters import *
 from env.task_env import TaskEnv
@@ -22,6 +31,7 @@ class Runner(object):
         self.localNetwork.to(self.device)
         self.localBaseline = AttentionNet(AGENT_INPUT_DIM, TASK_INPUT_DIM, EMBEDDING_DIM)
         self.localBaseline.to(self.device)
+        self.localValue = ValueNet(CRITIC_INPUT_DIM, CRITIC_HIDDEN_DIM).to(self.device)
 
     def get_weights(self):
         return self.localNetwork.state_dict()
@@ -32,12 +42,15 @@ class Runner(object):
     def set_baseline_weights(self, weights):
         self.localBaseline.load_state_dict(weights)
 
+    def set_value_weights(self, weights):
+        self.localValue.load_state_dict(weights)
+
     def singleThreadedJob(self, episodeNumber, agents_num, tasks_num):
         save_img = False
         if SAVE_IMG:
             if episodeNumber % SAVE_IMG_GAP == 0:
                 save_img = True
-        worker = Worker(self.metaAgentID, self.localNetwork, self.localBaseline,
+        worker = Worker(self.metaAgentID, self.localNetwork, self.localBaseline, self.localValue,
                         episodeNumber, self.device, save_img, agents_num, tasks_num)
         worker.work(episodeNumber)
 
@@ -46,23 +59,24 @@ class Runner(object):
         return jobResults, perf_metrics
 
     def testing(self, agents_range=AGENTS_RANGE, tasks_range=TASKS_RANGE, seed=None):
-        worker = Worker(self.metaAgentID, self.localNetwork, self.localBaseline,
+        worker = Worker(self.metaAgentID, self.localNetwork, self.localBaseline, self.localValue,
                         0, self.device, False, agents_num=agents_range, tasks_num=tasks_range, seed=seed)
         reward = worker.baseline_test()
         return reward
 
     def comparison(self, testing_ep, sample, sample_number, env_params):
-        worker = Worker(self.metaAgentID, self.localNetwork, self.localBaseline,
+        worker = Worker(self.metaAgentID, self.localNetwork, self.localBaseline, self.localValue,
                         0, self.device, False)
         env = TaskEnv(*env_params)
-        reward = worker.run_test(testing_ep, env, sample, sample_number)
+        reward = worker.run_test(testing_ep, env, sample)
         return reward, self.metaAgentID
 
-    def job(self, global_weights, baseline_weights, episodeNumber, agents_num, tasks_num):
+    def job(self, global_weights, baseline_weights, value_weights, episodeNumber, agents_num, tasks_num):
         print("starting episode {} on metaAgent {}".format(episodeNumber, self.metaAgentID))
         # set the local weights to the global weight values from the master network
         self.set_weights(global_weights)
         self.set_baseline_weights(baseline_weights)
+        self.set_value_weights(value_weights)
 
         jobResults, metrics = self.singleThreadedJob(episodeNumber, agents_num, tasks_num)
 
@@ -83,6 +97,6 @@ class RLRunner(Runner):
 if __name__ == '__main__':
     ray.init()
     runner = RLRunner.remote(0)
-    job_id = runner.singleThreadedJob.remote(1)
+    job_id = runner.singleThreadedJob.remote(1, AGENTS_RANGE[0], TASKS_RANGE[0])
     out = ray.get(job_id)
     print(out[1])

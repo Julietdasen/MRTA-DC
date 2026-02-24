@@ -27,7 +27,7 @@ local_device = torch.device('cuda:0') if USE_GPU else torch.device('cpu')
 global_network = AttentionNet(AGENT_INPUT_DIM, TASK_INPUT_DIM, EMBEDDING_DIM).to(device)
 checkpoint = torch.load(f'{model_path}/checkpoint.pth', map_location=torch.device('cpu'))
 global_network.load_state_dict(checkpoint['model'])
-worker = Worker(0, global_network, global_network, 0, device)
+worker = Worker(0, global_network, global_network, local_value=None, global_step=0, device=device)
 perf_metrics = {
     'success_rate': [],
     'makespan': [],

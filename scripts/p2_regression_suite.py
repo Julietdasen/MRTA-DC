@@ -40,6 +40,9 @@ def compare_csv(current_csv, reference_csv, output_md):
         ("utilization_exec", ["utilization_exec", "efficiency"]),
         ("utilization_wait", ["utilization_wait"]),
         ("utilization_travel", ["utilization_travel"]),
+        ("switch_rate", ["switch_rate"]),
+        ("quorum_break_rate", ["quorum_break_rate"]),
+        ("pause_events", ["pause_events"]),
     ]
 
     lines = []
@@ -133,6 +136,7 @@ def run_random_episode(seed, agents_num, tasks_num, max_time, max_steps):
 
     reward, finished_tasks = env.get_episode_reward()
     util_exec, util_wait, util_travel = env.get_utilization_metrics()
+    behavior = env.get_behavior_metrics()
 
     if not np.isfinite(float(reward)):
         invariant_ok = False
@@ -156,6 +160,9 @@ def run_random_episode(seed, agents_num, tasks_num, max_time, max_steps):
         "utilization_wait": float(util_wait),
         "utilization_travel": float(util_travel),
         "efficiency": float(util_exec),
+        "switch_rate": float(behavior["switch_rate"]),
+        "quorum_break_rate": float(behavior["quorum_break_rate"]),
+        "pause_events": float(behavior["pause_events"]),
         "reward": float(reward),
     }
 
@@ -172,6 +179,9 @@ def run_env_regression(seeds, agents_num, tasks_num, max_time, max_steps, out_cs
     waiting = np.array([float(row["waiting_time"]) for row in rows], dtype=float) if rows else np.array([])
     travel = np.array([float(row["travel_dist"]) for row in rows], dtype=float) if rows else np.array([])
     util_exec = np.array([float(row["utilization_exec"]) for row in rows], dtype=float) if rows else np.array([])
+    switch_rate = np.array([float(row["switch_rate"]) for row in rows], dtype=float) if rows else np.array([])
+    quorum_break_rate = np.array([float(row["quorum_break_rate"]) for row in rows], dtype=float) if rows else np.array([])
+    pause_events = np.array([float(row["pause_events"]) for row in rows], dtype=float) if rows else np.array([])
 
     summary = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -182,6 +192,9 @@ def run_env_regression(seeds, agents_num, tasks_num, max_time, max_steps, out_cs
         "waiting_time_mean": float(np.nanmean(waiting)) if waiting.size else np.nan,
         "travel_dist_mean": float(np.nanmean(travel)) if travel.size else np.nan,
         "utilization_exec_mean": float(np.nanmean(util_exec)) if util_exec.size else np.nan,
+        "switch_rate_mean": float(np.nanmean(switch_rate)) if switch_rate.size else np.nan,
+        "quorum_break_rate_mean": float(np.nanmean(quorum_break_rate)) if quorum_break_rate.size else np.nan,
+        "pause_events_mean": float(np.nanmean(pause_events)) if pause_events.size else np.nan,
     }
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=True, indent=2)

@@ -8,7 +8,10 @@ from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 class TaskEnv:
     def __init__(self, agents_range=(10, 10), tasks_range=(10, 10), traits_dim=1, max_coalition_size=3, max_duration=5,
                  seed=None, plot_figure=False, task_alpha=1.0, coalition_beta=0.8, mode_cost_type='linear',
-                 reward_w_makespan=1.0, reward_w_travel=0.05, reward_w_wait=0.1, reward_w_mode=0.05):
+                 reward_w_makespan=1.0, reward_w_travel=0.05, reward_w_wait=0.1, reward_w_mode=0.05,
+                 enable_commit_lock=True, min_commit_time=2.0, enable_quorum_protect=True,
+                 switch_penalty=0.15, quorum_break_penalty=0.5, pause_event_penalty=0.2,
+                 use_dense_event_reward=True, use_potential_shaping=True, potential_shaping_coef=1.0):
         """
         :param traits_dim: number of capabilities in this problem, e.g. 3 traits
         :param seed: seed to generate pseudo random problem instance
@@ -27,6 +30,16 @@ class TaskEnv:
         self.reward_w_travel = reward_w_travel
         self.reward_w_wait = reward_w_wait
         self.reward_w_mode = reward_w_mode
+        # v0.3 anti-oscillation and dense reward controls
+        self.enable_commit_lock = bool(enable_commit_lock)
+        self.min_commit_time = float(min_commit_time)
+        self.enable_quorum_protect = bool(enable_quorum_protect)
+        self.switch_penalty = float(switch_penalty)
+        self.quorum_break_penalty = float(quorum_break_penalty)
+        self.pause_event_penalty = float(pause_event_penalty)
+        self.use_dense_event_reward = bool(use_dense_event_reward)
+        self.use_potential_shaping = bool(use_potential_shaping)
+        self.potential_shaping_coef = float(potential_shaping_coef)
         if seed is not None:
             self.rng = np.random.default_rng(seed)
         self.traits_dim = traits_dim
@@ -44,6 +57,14 @@ class TaskEnv:
         self.force_waiting = True
         self.reactive_planning = False
         self.visible_length = 0
+        # v0.3 event counters and reward snapshots
+        self.total_switch_events = 0
+        self.total_quorum_break_events = 0
+        self.total_pause_events = 0
+        self.total_actions = 0
+        self._reward_snapshot = None
+        self._event_snapshot = None
+        self.reset_dense_reward_snapshot()
 
     def random_int(self, low, high, size=None):
         if self.rng is not None:
@@ -107,6 +128,8 @@ class TaskEnv:
                            'mode_cost': 0.0,
                            'active_members': [],
                            'arrived_members': [],
+                           'pause_events': 0,
+                           'quorum_break_events': 0,
                            'sum_waiting_time': 0,
                            'efficiency': 0,
                            'abandoned_agent': []}
@@ -135,7 +158,11 @@ class TaskEnv:
                             'target_task_id': -1,
                             'time_exec': 0.0,
                             'time_wait': 0.0,
-                            'time_travel': 0.0}
+                            'time_travel': 0.0,
+                            'commit_task_id': -1,
+                            'commit_until': 0.0,
+                            'last_task_id': -1,
+                            'switch_count': 0}
         depot = {'location': depot[0, :],
                  'members': [],
                  'ID': -1}
@@ -154,6 +181,10 @@ class TaskEnv:
         self.current_time = 0
         self.last_update_time = 0
         self.finished = False
+        self.total_switch_events = 0
+        self.total_quorum_break_events = 0
+        self.total_pause_events = 0
+        self.total_actions = 0
         for task in self.task_dic.values():
             if 'workload' not in task:
                 task['workload'] = float(task['time'])
@@ -175,6 +206,10 @@ class TaskEnv:
                 task['active_members'] = []
             if 'arrived_members' not in task:
                 task['arrived_members'] = []
+            if 'pause_events' not in task:
+                task['pause_events'] = 0
+            if 'quorum_break_events' not in task:
+                task['quorum_break_events'] = 0
             if 'abandoned_agent' not in task:
                 task['abandoned_agent'] = []
         for agent in self.agent_dic.values():
@@ -188,6 +223,15 @@ class TaskEnv:
                 agent['time_wait'] = 0.0
             if 'time_travel' not in agent:
                 agent['time_travel'] = 0.0
+            if 'commit_task_id' not in agent:
+                agent['commit_task_id'] = -1
+            if 'commit_until' not in agent:
+                agent['commit_until'] = 0.0
+            if 'last_task_id' not in agent:
+                agent['last_task_id'] = -1
+            if 'switch_count' not in agent:
+                agent['switch_count'] = 0
+        self.reset_dense_reward_snapshot()
 
     def clear_decisions(self):
         for task in self.task_dic.values():
@@ -195,17 +239,24 @@ class TaskEnv:
                         time_start=0, time_finish=0, remaining_workload=float(task['workload']), work_rate=0.0,
                         alpha=float(task.get('alpha', self.task_alpha)), start_team_size=0, mode_cost=0.0,
                         state='UNSTARTED', started=False, active_members=[], arrived_members=[],
+                        pause_events=0, quorum_break_events=0,
                         sum_waiting_time=0, efficiency=0, abandoned_agent=[])
         for agent in self.agent_dic.values():
             agent.update(route=[], location=self.depot['location'], next_location=self.depot['location'],
                          next_decision=0, travel_time=0, travel_dist=0, arrival_time=[], assigned=False,
                          sum_waiting_time=0, working_condition=0, current_action_index=0,
                          trajectory=[], angle=0, returned=False, pre_set_route=None, depot=self.depot['location'],
-                         state='IDLE_AT_DEPOT', target_task_id=-1, time_exec=0.0, time_wait=0.0, time_travel=0.0)
+                         state='IDLE_AT_DEPOT', target_task_id=-1, time_exec=0.0, time_wait=0.0, time_travel=0.0,
+                         commit_task_id=-1, commit_until=0.0, last_task_id=-1, switch_count=0)
         self.depot.update(members=[], ID=-1)
         self.current_time = 0
         self.last_update_time = 0
         self.finished = False
+        self.total_switch_events = 0
+        self.total_quorum_break_events = 0
+        self.total_pause_events = 0
+        self.total_actions = 0
+        self.reset_dense_reward_snapshot()
 
     @staticmethod
     def find_by_key(data, target):
@@ -243,6 +294,197 @@ class TaskEnv:
             return float(n ** 2)
         # Current default is linear mode cost h(n)=n.
         return float(n)
+
+    @staticmethod
+    def _task_requirement(task):
+        return int(max(1, np.ceil(np.sum(task['requirements']))))
+
+    def _potential_value(self):
+        ratios = []
+        for task in self.task_dic.values():
+            workload = float(max(task.get('workload', task.get('time', 1.0)), self.eps))
+            remaining = float(max(task.get('remaining_workload', workload), 0.0))
+            ratios.append(remaining / workload)
+        if not ratios:
+            return 0.0
+        return -float(np.mean(ratios))
+
+    def _collect_reward_components(self):
+        total_travel_time = float(np.sum([agent.get('time_travel', 0.0) for agent in self.agent_dic.values()]))
+        total_waiting_time = float(np.sum([agent.get('time_wait', 0.0) for agent in self.agent_dic.values()]))
+        total_mode_cost = float(np.sum([task.get('mode_cost', 0.0) for task in self.task_dic.values()]))
+        return {
+            'time': float(self.current_time),
+            'travel': total_travel_time,
+            'wait': total_waiting_time,
+            'mode': total_mode_cost,
+            'potential': self._potential_value(),
+            'switch_events': int(self.total_switch_events),
+            'quorum_break_events': int(self.total_quorum_break_events),
+            'pause_events': int(self.total_pause_events),
+        }
+
+    def reset_dense_reward_snapshot(self):
+        snapshot = self._collect_reward_components()
+        self._reward_snapshot = snapshot.copy()
+        self._event_snapshot = snapshot.copy()
+
+    def get_dense_reward_delta(self, reset=True):
+        current = self._collect_reward_components()
+        if self._reward_snapshot is None:
+            self.reset_dense_reward_snapshot()
+        prev = self._reward_snapshot
+
+        dt = float(current['time'] - prev['time'])
+        d_travel = float(current['travel'] - prev['travel'])
+        d_wait = float(current['wait'] - prev['wait'])
+        d_mode = float(current['mode'] - prev['mode'])
+        d_switch = int(current['switch_events'] - prev['switch_events'])
+        d_quorum_break = int(current['quorum_break_events'] - prev['quorum_break_events'])
+        d_pause = int(current['pause_events'] - prev['pause_events'])
+
+        if self.use_dense_event_reward:
+            reward = -(
+                self.reward_w_makespan * dt
+                + self.reward_w_travel * d_travel
+                + self.reward_w_wait * d_wait
+                + self.reward_w_mode * d_mode
+            )
+        else:
+            reward = 0.0
+
+        reward -= self.switch_penalty * d_switch
+        reward -= self.quorum_break_penalty * d_quorum_break
+        reward -= self.pause_event_penalty * d_pause
+
+        if self.use_potential_shaping:
+            reward += self.potential_shaping_coef * float(current['potential'] - prev['potential'])
+
+        out = {
+            'reward': float(reward),
+            'dt': dt,
+            'delta_travel': d_travel,
+            'delta_wait': d_wait,
+            'delta_mode': d_mode,
+            'switch_events': d_switch,
+            'quorum_break_events': d_quorum_break,
+            'pause_events': d_pause,
+            'potential': float(current['potential']),
+        }
+        if reset:
+            self._reward_snapshot = current.copy()
+        return out
+
+    def _can_leave_task(self, agent_id, from_task_id):
+        if not self.enable_quorum_protect:
+            return True
+        if from_task_id not in self.task_dic:
+            return True
+        task = self.task_dic[from_task_id]
+        if task['finished']:
+            return True
+        if agent_id not in task.get('active_members', []):
+            return True
+        requirement = self._task_requirement(task)
+        n_active = len(task.get('active_members', []))
+        if n_active > requirement:
+            return True
+
+        # Allow leaving when this task has already waited beyond the replanning timeout.
+        waiting_deadline = float(self.get_arrival_time(agent_id, from_task_id) + self.max_waiting_time)
+        return bool(self.current_time >= waiting_deadline - self.eps)
+
+    def get_action_mask(self, agent_id):
+        mask = self.get_unfinished_task_mask()
+        if np.sum(mask) == self.tasks_num:
+            mask = np.insert(mask, 0, False)
+        else:
+            mask = np.insert(mask, 0, True)
+        mask = mask.astype(bool)
+
+        agent = self.agent_dic[agent_id]
+        current_target = int(agent.get('target_task_id', -1))
+        locked_task = int(agent.get('commit_task_id', -1))
+        lock_active = (
+            self.enable_commit_lock
+            and locked_task in self.task_dic
+            and not self.task_dic[locked_task]['finished']
+            and float(self.current_time) < float(agent.get('commit_until', 0.0)) - self.eps
+        )
+        if lock_active:
+            constrained = np.ones_like(mask, dtype=bool)
+            constrained[locked_task + 1] = mask[locked_task + 1]
+            return constrained
+
+        if current_target in self.task_dic and not self._can_leave_task(agent_id, current_target):
+            constrained = np.ones_like(mask, dtype=bool)
+            constrained[current_target + 1] = mask[current_target + 1]
+            return constrained
+
+        return mask
+
+    def get_global_features(self):
+        unfinished = np.array(self.get_unfinished_tasks(), dtype=np.float32)
+        unfinished_ratio = float(np.mean(unfinished)) if unfinished.size else 0.0
+        done_ratio = 1.0 - unfinished_ratio
+
+        rem_ratio = []
+        active_count = 0
+        paused_count = 0
+        team_sizes = []
+        for task in self.task_dic.values():
+            workload = float(max(task.get('workload', task.get('time', 1.0)), self.eps))
+            rem_ratio.append(float(task.get('remaining_workload', workload)) / workload)
+            if task.get('state') == 'ACTIVE':
+                active_count += 1
+            if task.get('state') == 'PAUSED':
+                paused_count += 1
+            team_sizes.append(float(len(task.get('active_members', []))))
+
+        rem_ratio = np.array(rem_ratio, dtype=np.float32) if rem_ratio else np.zeros((1,), dtype=np.float32)
+        team_sizes = np.array(team_sizes, dtype=np.float32) if team_sizes else np.zeros((1,), dtype=np.float32)
+        active_ratio = float(active_count / max(self.tasks_num, 1))
+        paused_ratio = float(paused_count / max(self.tasks_num, 1))
+        team_mean = float(np.mean(team_sizes) / max(self.max_coalition_size, 1))
+
+        util_exec, util_wait, util_travel = self.get_utilization_metrics()
+        mean_wait = float(np.mean([a.get('time_wait', 0.0) for a in self.agent_dic.values()])) if self.agent_dic else 0.0
+        mean_travel = float(np.mean([a.get('time_travel', 0.0) for a in self.agent_dic.values()])) if self.agent_dic else 0.0
+        mean_exec = float(np.mean([a.get('time_exec', 0.0) for a in self.agent_dic.values()])) if self.agent_dic else 0.0
+        makespan = float(max(self.current_time, self.eps))
+
+        action_denom = float(max(self.total_actions, 1))
+        switch_rate = float(self.total_switch_events / action_denom)
+        quorum_break_rate = float(self.total_quorum_break_events / action_denom)
+        pause_rate = float(self.total_pause_events / max(self.tasks_num, 1))
+
+        features = np.array([
+            float(self.current_time / max(self.max_duration * max(self.tasks_num, 1), 1.0)),
+            unfinished_ratio,
+            done_ratio,
+            float(np.mean(rem_ratio)),
+            float(np.std(rem_ratio)),
+            active_ratio,
+            paused_ratio,
+            team_mean,
+            float(util_exec),
+            float(util_wait),
+            float(util_travel),
+            float(mean_wait / makespan),
+            float(mean_travel / makespan),
+            switch_rate,
+            quorum_break_rate,
+            pause_rate,
+        ], dtype=np.float32)
+        return features
+
+    def get_behavior_metrics(self):
+        action_denom = float(max(self.total_actions, 1))
+        return {
+            'switch_rate': float(self.total_switch_events / action_denom),
+            'quorum_break_rate': float(self.total_quorum_break_events / action_denom),
+            'pause_events': float(self.total_pause_events),
+        }
 
     def get_current_agent_status(self, agent):
         status = []
@@ -438,6 +680,7 @@ class TaskEnv:
         self._refresh_task_members()
 
         for task in self.task_dic.values():
+            prev_state = task.get('state', 'UNSTARTED')
             was_finished = bool(task['finished'])
             if float(task['remaining_workload']) <= self.eps:
                 task['remaining_workload'] = 0.0
@@ -445,7 +688,7 @@ class TaskEnv:
                 task['state'] = 'FINISHED'
 
             arrived_members = task.get('arrived_members', [])
-            requirement = int(max(1, np.ceil(np.sum(task['requirements']))))
+            requirement = self._task_requirement(task)
             task['status'] = np.clip(task['requirements'] - len(arrived_members), a_min=0, a_max=None)
 
             if task['finished']:
@@ -484,10 +727,15 @@ class TaskEnv:
                         task['abandoned_agent'].append(member)
                         self.agent_dic[member]['next_decision'] = float(self.current_time)
 
+            if prev_state == 'ACTIVE' and task['state'] == 'PAUSED':
+                task['pause_events'] = int(task.get('pause_events', 0)) + 1
+                self.total_pause_events += 1
+
         all_finished = bool(np.all(self.get_matrix(self.task_dic, 'finished')))
         for member in self.depot['members']:
             if self.current_time >= self.get_arrival_time(member, -1) and all_finished:
                 self.agent_dic[member]['returned'] = True
+                self.agent_dic[member]['next_decision'] = np.nan
 
         return finished_tasks
 
@@ -516,13 +764,21 @@ class TaskEnv:
         """
         #  choose any task
         task_id = task_id - 1
+        if task_id not in self.task_dic and task_id != -1:
+            task_id = -1
         agent = self.agent_dic[agent_id]
+        previous_target = int(agent['route'][-1]) if agent['route'] else -1
 
         # Leave current target/task immediately when replanning.
         if agent['route']:
-            previous_target = int(agent['route'][-1])
             if previous_target != -1 and previous_target in self.task_dic:
                 previous_task = self.task_dic[previous_target]
+                if previous_target != task_id and agent_id in previous_task.get('active_members', []):
+                    requirement = self._task_requirement(previous_task)
+                    n_active = len(previous_task.get('active_members', []))
+                    if n_active <= requirement and float(previous_task.get('remaining_workload', 0.0)) > self.eps:
+                        previous_task['quorum_break_events'] = int(previous_task.get('quorum_break_events', 0)) + 1
+                        self.total_quorum_break_events += 1
                 if agent_id in previous_task['members']:
                     previous_task['members'].remove(agent_id)
                 if agent_id in previous_task.get('arrived_members', []):
@@ -532,11 +788,24 @@ class TaskEnv:
             elif previous_target == -1 and agent_id in self.depot['members']:
                 self.depot['members'].remove(agent_id)
 
+        if previous_target != -1 and previous_target != task_id:
+            agent['switch_count'] = int(agent.get('switch_count', 0)) + 1
+            self.total_switch_events += 1
+        self.total_actions += 1
+
         if task_id != -1:
             task = self.task_dic[task_id]
             agent['returned'] = False
+            agent['commit_task_id'] = task_id
+            if self.enable_commit_lock:
+                agent['commit_until'] = float(self.current_time + self.min_commit_time)
+            else:
+                agent['commit_until'] = float(self.current_time)
         else:
             task = self.depot
+            agent['commit_task_id'] = -1
+            agent['commit_until'] = float(self.current_time)
+        agent['last_task_id'] = previous_target
         agent['route'].append(task_id)
         travel_time = self.calculate_eulidean_distance(agent, task) / agent['velocity']
         agent['travel_time'] = travel_time

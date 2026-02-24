@@ -1,0 +1,4 @@
+{"timestamp": "2026-02-24T15:26:19", "episode": 1024, "test_mean": -178.31784802029387, "baseline_mean": -180.8245848011963, "p_value": 6.857246817807417e-05, "best_updated": true, "best_perf": -178.31784802029387}
+{"timestamp": "2026-02-24T16:30:00", "episode": 2048, "test_mean": -180.03976808761996, "baseline_mean": -181.19279886952862, "p_value": 0.03108802776484343, "best_updated": true, "best_perf": -180.03976808761996}
+{"timestamp": "2026-02-24T17:33:13", "episode": 3072, "test_mean": -180.12667581138595, "baseline_mean": -178.01716761806858, "p_value": null, "best_updated": false, "best_perf": -180.03976808761996}
+{"timestamp": "2026-02-24T18:30:04", "episode": 4096, "test_mean": -177.12157241536474, "baseline_mean": -178.01716761806858, "p_value": 0.08796117195640175, "best_updated": false, "best_perf": -180.03976808761996}

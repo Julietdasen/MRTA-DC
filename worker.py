@@ -1,35 +1,32 @@
-import pickle
-import time
-import torch
-import numpy as np
-from env.task_env import TaskEnv
-from attention import AttentionNet
-import scipy.signal as signal
-from parameters import *
 import copy
-from torch.nn import functional as F
+import numpy as np
+import torch
 from torch.distributions import Categorical
+from torch.nn import functional as F
 
-
-def discount(x, gamma):
-    return signal.lfilter([1], [1, -gamma], x[::-1], axis=0)[::-1]
-
-
-def zero_padding(x, padding_size, length):
-    pad = torch.nn.ZeroPad2d((0, 0, 0, padding_size - length))
-    x = pad(x)
-    return x
+from attention import AttentionNet
+from env.task_env import TaskEnv
+from parameters import *
 
 
 class Worker:
-    def __init__(self, mete_agent_id, local_network, local_baseline, global_step,
-                 device='cuda', save_image=False, agents_num=AGENTS_RANGE, tasks_num=TASKS_RANGE, seed=None):
-
+    def __init__(
+        self,
+        mete_agent_id,
+        local_network,
+        local_baseline,
+        local_value=None,
+        global_step=0,
+        device='cuda',
+        save_image=False,
+        agents_num=AGENTS_RANGE,
+        tasks_num=TASKS_RANGE,
+        seed=None,
+    ):
         self.device = device
         self.metaAgentID = mete_agent_id
         self.global_step = global_step
         self.save_image = save_image
-        # Pass v0.1 dynamic-task parameters from central config.
         self.env = TaskEnv(
             agents_num,
             tasks_num,
@@ -44,228 +41,247 @@ class Worker:
             reward_w_travel=REWARD_W_TRAVEL,
             reward_w_wait=REWARD_W_WAIT,
             reward_w_mode=REWARD_W_MODE,
+            enable_commit_lock=ENABLE_COMMIT_LOCK,
+            min_commit_time=MIN_COMMIT_TIME,
+            enable_quorum_protect=ENABLE_QUORUM_PROTECT,
+            switch_penalty=SWITCH_PENALTY,
+            quorum_break_penalty=QUORUM_BREAK_PENALTY,
+            pause_event_penalty=PAUSE_EVENT_PENALTY,
+            use_dense_event_reward=USE_DENSE_EVENT_REWARD,
+            use_potential_shaping=USE_POTENTIAL_SHAPING,
+            potential_shaping_coef=POTENTIAL_SHAPING_COEF,
         )
         self.baseline_env = copy.deepcopy(self.env)
         self.local_net = local_network
         self.local_baseline = local_baseline
+        self.local_value = local_value
         self.experience = None
         self.episode_number = None
         self.perf_metrics = {}
-        self.p_rnn_state = {}
+
+    @staticmethod
+    def _compute_gae(rewards, values, dones, gamma, gae_lambda):
+        adv = np.zeros_like(rewards, dtype=np.float32)
+        gae = 0.0
+        next_value = 0.0
+        for t in reversed(range(len(rewards))):
+            mask = 1.0 - float(dones[t])
+            delta = float(rewards[t]) + gamma * next_value * mask - float(values[t])
+            gae = delta + gamma * gae_lambda * mask * gae
+            adv[t] = gae
+            next_value = float(values[t])
+        returns = adv + values
+        return adv, returns
+
+    def _build_step_tensors(self, env, agent):
+        mask_np = env.get_action_mask(agent['ID'])
+        total_agents = torch.FloatTensor(env.get_current_agent_status(agent)).unsqueeze(0).to(self.device)
+        task_info = torch.FloatTensor(env.get_current_task_status(agent)).unsqueeze(0).to(self.device)
+        mask = torch.tensor(mask_np, dtype=torch.bool).unsqueeze(0).to(self.device)
+        global_feat = torch.FloatTensor(env.get_global_features()).unsqueeze(0).to(self.device)
+        return total_agents, task_info, mask, global_feat
+
+    def _sample_action(self, logp_list, mask, tasks_num):
+        action = Categorical(logp_list.exp()).sample()
+        n_tries = 0
+        while action.item() > tasks_num or mask[:, action.item()].all().item():
+            action = Categorical(logp_list.exp()).sample()
+            n_tries += 1
+            if n_tries >= 512:
+                valid_logp = logp_list.clone()
+                valid_logp[mask] = float('-inf')
+                if tasks_num + 1 < valid_logp.shape[-1]:
+                    valid_logp[..., tasks_num + 1:] = float('-inf')
+                action = valid_logp.argmax(dim=-1)
+                break
+        return action
 
     def run_episode(self, episode_number):
-        episode_buffer = [[] for _ in range(9)]
-        perf_metrics = {}
+        episode = {
+            'agent_inputs': [],
+            'task_inputs': [],
+            'actions': [],
+            'masks': [],
+            'rewards': [],
+            'dones': [],
+            'values': [],
+            'global_feats': [],
+            'advantages': [],
+            'returns': [],
+        }
+        self.env.reset_dense_reward_snapshot()
         current_action_index = 0
-        while not self.env.finished and self.env.current_time < MAX_TIME:
+
+        while (not self.env.finished) and self.env.current_time < MAX_TIME:
             with torch.no_grad():
                 decision_agents, current_time = self.env.next_decision()
-                groups = self.env.get_unique_group(decision_agents)
+                groups = self.env.get_unique_group(decision_agents) if len(decision_agents) > 0 else []
                 self.env.current_time = current_time
                 self.env.task_update()
                 self.env.agent_update()
+
                 for group in groups:
                     while len(group) > 0:
-                        leader_id = np.random.choice(group)
+                        leader_id = int(np.random.choice(group))
                         agent = self.env.agent_dic[leader_id]
-                        if not agent['returned']:
-                            mask = self.env.get_unfinished_task_mask()
-                            if np.sum(mask) == self.env.tasks_num:
-                                mask = np.insert(mask, 0, False)
-                            else:
-                                mask = np.insert(mask, 0, True)
-                            total_agents = torch.FloatTensor(self.env.get_current_agent_status(agent)).unsqueeze(0).to(self.device)
-                            # total_agents = self.zero_padding(total_agents, AGENTS_RANGE[1])
-                            task_info = torch.FloatTensor(self.env.get_current_task_status(agent)).unsqueeze(0).to(self.device)
-                            # task_info = self.zero_padding(task_info, TASKS_RANGE[1] + 1)
-                            mask = torch.tensor(mask).unsqueeze(0).to(self.device)
-                            # mask = self.true_padding(mask, TASKS_RANGE[1] + 1)
-                            agent_id = torch.tensor([[[agent['ID']]]]).to(self.device)
-                            logp_list = self.local_net(task_info, total_agents, mask)
-                            action = Categorical(logp_list.exp()).sample()
-                            while action.item() > self.env.tasks_num:
-                                action = Categorical(logp_list.exp()).sample()
-                            group, r = self.env.step(group, leader_id, action.item(), current_action_index)
-                            f = self.env.task_update()
-                            agent['current_action_index'] = current_action_index
-                            self.env.agent_update()
-                            episode_buffer[0] += total_agents
-                            episode_buffer[1] += task_info
-                            episode_buffer[2] += action.unsqueeze(0)
-                            episode_buffer[3] += mask
-                            episode_buffer[4] += torch.FloatTensor([[0]]).to(self.device)  # reward
-                            episode_buffer[5] += agent_id
-                            episode_buffer[6] += torch.FloatTensor([[0]]).to(self.device)  # adv
-                            current_action_index += 1
+                        if agent['returned']:
+                            group.remove(leader_id)
+                            continue
+
+                        total_agents, task_info, mask, global_feat = self._build_step_tensors(self.env, agent)
+                        logp_list = self.local_net(task_info, total_agents, mask)
+                        action = self._sample_action(logp_list, mask, self.env.tasks_num)
+                        if USE_CRITIC and self.local_value is not None:
+                            value_t = self.local_value(global_feat).squeeze(-1)
+                        else:
+                            value_t = torch.zeros((1,), dtype=torch.float32, device=self.device)
+
+                        group, _ = self.env.step(group, leader_id, int(action.item()), current_action_index)
+                        self.env.task_update()
+                        self.env.agent_update()
+                        reward_info = self.env.get_dense_reward_delta(reset=True)
+
+                        episode['agent_inputs'].append(total_agents)
+                        episode['task_inputs'].append(task_info)
+                        episode['actions'].append(action.unsqueeze(0))
+                        episode['masks'].append(mask)
+                        episode['rewards'].append(torch.tensor([[float(reward_info['reward'])]], dtype=torch.float32, device=self.device))
+                        episode['dones'].append(torch.tensor([[0.0]], dtype=torch.float32, device=self.device))
+                        episode['values'].append(value_t.view(1, 1))
+                        episode['global_feats'].append(global_feat)
+                        current_action_index += 1
+
                 self.env.finished = self.env.check_finished()
+                tail_delta = self.env.get_dense_reward_delta(reset=True)
+                if episode['rewards']:
+                    episode['rewards'][-1] = episode['rewards'][-1] + torch.tensor(
+                        [[float(tail_delta['reward'])]], dtype=torch.float32, device=self.device
+                    )
 
         reward, finished_tasks = self.env.get_episode_reward(MAX_TIME)
-        # traceback_rewards = self.env.get_traceback_reward()
-        self.baseline_test()
-        greedy_reward, _ = self.baseline_env.get_episode_reward(MAX_TIME)
-        episode_buffer[4][-1] += reward
-        adv = reward - greedy_reward
-        episode_buffer[6][-1] += adv
-        advantages = copy.deepcopy(episode_buffer[6])
 
-        for i in range(len(advantages)):
-            advantages[i] = advantages[i].cpu().numpy()
-        discounted_advantages = discount(np.array(advantages).reshape(-1), GAMMA).tolist()
-        discounted_advantages = torch.FloatTensor(discounted_advantages).unsqueeze(1).to(self.device)
-        for i in range(len(advantages)):
-            episode_buffer[6][i] = discounted_advantages[i, :]
+        if episode['dones']:
+            episode['dones'][-1] = torch.tensor([[1.0]], dtype=torch.float32, device=self.device)
+            rewards_np = np.array([x.item() for x in episode['rewards']], dtype=np.float32)
+            values_np = np.array([x.item() for x in episode['values']], dtype=np.float32)
+            dones_np = np.array([x.item() for x in episode['dones']], dtype=np.float32)
+            advantages, returns = self._compute_gae(rewards_np, values_np, dones_np, GAMMA, GAE_LAMBDA)
+            for adv, ret in zip(advantages, returns):
+                episode['advantages'].append(torch.tensor([[float(adv)]], dtype=torch.float32, device=self.device))
+                episode['returns'].append(torch.tensor([[float(ret)]], dtype=torch.float32, device=self.device))
 
-        perf_metrics['success_rate'] = np.sum(finished_tasks)/len(finished_tasks)
-        perf_metrics['makespan'] = self.env.current_time
-        perf_metrics['time_cost'] = np.nanmean(self.env.get_matrix(self.env.task_dic, 'time_start'))
-        perf_metrics['waiting_time'] = np.mean(self.env.get_matrix(self.env.agent_dic, 'sum_waiting_time'))
-        perf_metrics['travel_dist'] = np.sum(self.env.get_matrix(self.env.agent_dic, 'travel_dist'))
+        perf_metrics = {
+            'success_rate': float(np.sum(finished_tasks) / len(finished_tasks)),
+            'makespan': float(self.env.current_time),
+            'time_cost': float(np.nanmean(self.env.get_matrix(self.env.task_dic, 'time_start'))),
+            'waiting_time': float(np.mean(self.env.get_matrix(self.env.agent_dic, 'sum_waiting_time'))),
+            'travel_dist': float(np.sum(self.env.get_matrix(self.env.agent_dic, 'travel_dist'))),
+            'reward': float(reward),
+            'episode_steps': float(len(episode['rewards'])),
+        }
         util_exec, util_wait, util_travel = self.env.get_utilization_metrics()
-        perf_metrics['utilization_exec'] = util_exec
-        perf_metrics['utilization_wait'] = util_wait
-        perf_metrics['utilization_travel'] = util_travel
-        # Backward-compatible alias kept for existing logs/scripts.
-        perf_metrics['efficiency'] = util_exec
+        perf_metrics['utilization_exec'] = float(util_exec)
+        perf_metrics['utilization_wait'] = float(util_wait)
+        perf_metrics['utilization_travel'] = float(util_travel)
+        perf_metrics['efficiency'] = float(util_exec)
+        perf_metrics.update(self.env.get_behavior_metrics())
+
         if self.save_image:
             self.env.plot_animation(gifs_path, episode_number)
-        self.experience = episode_buffer
+        self.experience = episode
         return perf_metrics
 
-    def run_test(self, test_episode, test_env, image_path=None):
-        perf_metrics = dict()
-        self.baseline_env = copy.copy(test_env)
-        self.baseline_env.plot_figure = False
-        while not self.baseline_env.finished and self.baseline_env.current_time < MAX_TIME:
+    def _greedy_policy_eval(self, env):
+        while not env.finished and env.current_time < MAX_TIME:
             with torch.no_grad():
-                decision_agents, current_time = self.baseline_env.next_decision()
-                groups = self.baseline_env.get_unique_group(decision_agents)
-                self.baseline_env.current_time = current_time
-                self.baseline_env.task_update()
-                self.baseline_env.agent_update()
+                decision_agents, current_time = env.next_decision()
+                groups = env.get_unique_group(decision_agents)
+                env.current_time = current_time
+                env.task_update()
+                env.agent_update()
                 for group in groups:
                     while len(group) > 0:
-                        leader_id = np.random.choice(group)
-                        agent = self.baseline_env.agent_dic[leader_id]
-                        if not agent['returned']:
-                            mask = self.baseline_env.get_unfinished_task_mask()
-                            if np.sum(mask) == self.baseline_env.tasks_num:
-                                mask = np.insert(mask, 0, False)
-                            else:
-                                mask = np.insert(mask, 0, True)
-                            total_agents = torch.FloatTensor(self.baseline_env.get_current_agent_status(agent)).unsqueeze(0).to(self.device)
-                            task_info = torch.FloatTensor(self.baseline_env.get_current_task_status(agent)).unsqueeze(0).to(self.device)
-                            mask = torch.tensor(mask).unsqueeze(0).to(self.device)
-                            agent_id = torch.tensor([[[agent['ID']]]]).to(self.device)
-                            logp_list = self.local_net(task_info, total_agents, mask)
-                            action = torch.argmax(logp_list.exp() * ~mask, dim=1)
-                            group, r = self.baseline_env.step(group, leader_id, action.item(), 0)
-                            self.baseline_env.task_update()
-                            self.baseline_env.agent_update()
-                self.baseline_env.finished = self.baseline_env.check_finished()
-        reward, finished_tasks = self.baseline_env.get_episode_reward(MAX_TIME)
+                        leader_id = int(np.random.choice(group))
+                        agent = env.agent_dic[leader_id]
+                        if agent['returned']:
+                            group.remove(leader_id)
+                            continue
+                        total_agents, task_info, mask, _ = self._build_step_tensors(env, agent)
+                        logp_list = self.local_net(task_info, total_agents, mask)
+                        masked_scores = logp_list.exp().clone()
+                        masked_scores[mask] = -1e9
+                        action = torch.argmax(masked_scores, dim=1)
+                        group, _ = env.step(group, leader_id, action.item(), 0)
+                        env.task_update()
+                        env.agent_update()
+                env.finished = env.check_finished()
 
-        perf_metrics['success_rate'] = np.sum(finished_tasks)/len(finished_tasks)
-        perf_metrics['makespan'] = self.baseline_env.current_time
-        perf_metrics['time_cost'] = np.nanmean(self.baseline_env.get_matrix(self.baseline_env.task_dic, 'time_start'))
-        perf_metrics['waiting_time'] = np.mean(self.baseline_env.get_matrix(self.baseline_env.agent_dic, 'sum_waiting_time'))
-        perf_metrics['travel_dist'] = np.sum(self.baseline_env.get_matrix(self.baseline_env.agent_dic, 'travel_dist'))
+    def run_test(self, test_episode, test_env, image_path=None):
+        perf_metrics = {}
+        self.baseline_env = copy.copy(test_env)
+        self.baseline_env.plot_figure = False
+        self._greedy_policy_eval(self.baseline_env)
+        _, finished_tasks = self.baseline_env.get_episode_reward(MAX_TIME)
+
+        perf_metrics['success_rate'] = float(np.sum(finished_tasks) / len(finished_tasks))
+        perf_metrics['makespan'] = float(self.baseline_env.current_time)
+        perf_metrics['time_cost'] = float(np.nanmean(self.baseline_env.get_matrix(self.baseline_env.task_dic, 'time_start')))
+        perf_metrics['waiting_time'] = float(np.mean(self.baseline_env.get_matrix(self.baseline_env.agent_dic, 'sum_waiting_time')))
+        perf_metrics['travel_dist'] = float(np.sum(self.baseline_env.get_matrix(self.baseline_env.agent_dic, 'travel_dist')))
         util_exec, util_wait, util_travel = self.baseline_env.get_utilization_metrics()
-        perf_metrics['utilization_exec'] = util_exec
-        perf_metrics['utilization_wait'] = util_wait
-        perf_metrics['utilization_travel'] = util_travel
-        perf_metrics['efficiency'] = util_exec
+        perf_metrics['utilization_exec'] = float(util_exec)
+        perf_metrics['utilization_wait'] = float(util_wait)
+        perf_metrics['utilization_travel'] = float(util_travel)
+        perf_metrics['efficiency'] = float(util_exec)
         if image_path is not None:
             self.baseline_env.plot_animation(image_path, 'RL')
-        # self.generate_route()
-        # self.baseline_env.process_map(image_path)
         return perf_metrics
 
     def run_test_IS(self, test_episode, test_env):
-        perf_metrics = dict()
+        perf_metrics = {}
         self.baseline_env = copy.copy(test_env)
         self.baseline_env.plot_figure = False
+
         while not self.baseline_env.finished and self.baseline_env.current_time < MAX_TIME:
             with torch.no_grad():
                 decision_agents, current_time = self.baseline_env.next_decision()
-                # groups = self.baseline_env.get_unique_group(decision_agents)
                 self.baseline_env.current_time = current_time
                 self.baseline_env.task_update()
                 self.baseline_env.agent_update()
-                for agent_id in decision_agents:
-                    # while len(group) > 0:
-                    # leader_id = np.random.choice(group)
-                    agent = self.baseline_env.agent_dic[agent_id]
-                    if not agent['returned']:
-                        mask = self.baseline_env.get_unfinished_task_mask()
-                        if np.sum(mask) == self.baseline_env.tasks_num:
-                            mask = np.insert(mask, 0, False)
-                        else:
-                            mask = np.insert(mask, 0, True)
-                        total_agents = torch.FloatTensor(self.baseline_env.get_current_agent_status(agent)).unsqueeze(0).to(self.device)
-                        task_info = torch.FloatTensor(self.baseline_env.get_current_task_status(agent)).unsqueeze(0).to(self.device)
-                        mask = torch.tensor(mask).unsqueeze(0).to(self.device)
-                        agent_id = torch.tensor([[[agent['ID']]]]).to(self.device)
-                        logp_list = self.local_net(task_info, total_agents, mask)
-                        action = torch.argmax(logp_list.exp() * ~mask, dim=1)
-                        self.baseline_env.agent_step(agent_id.item(), action.item())
-                        self.baseline_env.task_update()
-                        self.baseline_env.agent_update()
+                for aid in decision_agents:
+                    agent = self.baseline_env.agent_dic[aid]
+                    if agent['returned']:
+                        continue
+                    total_agents, task_info, mask, _ = self._build_step_tensors(self.baseline_env, agent)
+                    logp_list = self.local_net(task_info, total_agents, mask)
+                    masked_scores = logp_list.exp().clone()
+                    masked_scores[mask] = -1e9
+                    action = torch.argmax(masked_scores, dim=1)
+                    self.baseline_env.agent_step(int(aid), int(action.item()))
+                    self.baseline_env.task_update()
+                    self.baseline_env.agent_update()
                 self.baseline_env.finished = self.baseline_env.check_finished()
-        reward, finished_tasks = self.baseline_env.get_episode_reward(MAX_TIME)
 
-        perf_metrics['success_rate'] = np.sum(finished_tasks)/len(finished_tasks)
-        perf_metrics['makespan'] = self.baseline_env.current_time
-        perf_metrics['time_cost'] = np.nanmean(self.baseline_env.get_matrix(self.baseline_env.task_dic, 'time_start'))
-        perf_metrics['waiting_time'] = np.mean(self.baseline_env.get_matrix(self.baseline_env.agent_dic, 'sum_waiting_time'))
-        perf_metrics['travel_dist'] = np.sum(self.baseline_env.get_matrix(self.baseline_env.agent_dic, 'travel_dist'))
+        _, finished_tasks = self.baseline_env.get_episode_reward(MAX_TIME)
+        perf_metrics['success_rate'] = float(np.sum(finished_tasks) / len(finished_tasks))
+        perf_metrics['makespan'] = float(self.baseline_env.current_time)
+        perf_metrics['time_cost'] = float(np.nanmean(self.baseline_env.get_matrix(self.baseline_env.task_dic, 'time_start')))
+        perf_metrics['waiting_time'] = float(np.mean(self.baseline_env.get_matrix(self.baseline_env.agent_dic, 'sum_waiting_time')))
+        perf_metrics['travel_dist'] = float(np.sum(self.baseline_env.get_matrix(self.baseline_env.agent_dic, 'travel_dist')))
         util_exec, util_wait, util_travel = self.baseline_env.get_utilization_metrics()
-        perf_metrics['utilization_exec'] = util_exec
-        perf_metrics['utilization_wait'] = util_wait
-        perf_metrics['utilization_travel'] = util_travel
-        perf_metrics['efficiency'] = util_exec
+        perf_metrics['utilization_exec'] = float(util_exec)
+        perf_metrics['utilization_wait'] = float(util_wait)
+        perf_metrics['utilization_travel'] = float(util_travel)
+        perf_metrics['efficiency'] = float(util_exec)
         return perf_metrics
 
     def baseline_test(self):
         self.baseline_env.plot_figure = False
-        perf_metrics = {}
-        while not self.baseline_env.finished and self.baseline_env.current_time < MAX_TIME:
-            with torch.no_grad():
-                decision_agents, current_time = self.baseline_env.next_decision()
-                groups = self.baseline_env.get_unique_group(decision_agents)
-                self.baseline_env.current_time = current_time
-                self.baseline_env.task_update()
-                self.baseline_env.agent_update()
-                for group in groups:
-                    while len(group) > 0:
-                        leader_id = np.random.choice(group)
-                        agent = self.baseline_env.agent_dic[leader_id]
-                        if not agent['returned']:
-                            mask = self.baseline_env.get_unfinished_task_mask()
-                            if np.sum(mask) == self.baseline_env.tasks_num:
-                                mask = np.insert(mask, 0, False)
-                            else:
-                                mask = np.insert(mask, 0, True)
-                            total_agents = torch.FloatTensor(self.baseline_env.get_current_agent_status(agent)).unsqueeze(0).to(self.device)
-                            # total_agents = self.zero_padding(total_agents, AGENTS_RANGE[1])
-                            task_info = torch.FloatTensor(self.baseline_env.get_current_task_status(agent)).unsqueeze(0).to(self.device)
-                            # task_info = self.zero_padding(task_info, TASKS_RANGE[1] + 1)
-                            mask = torch.tensor(mask).unsqueeze(0).to(self.device)
-                            # mask = self.true_padding(mask, TASKS_RANGE[1] + 1)
-                            agent_id = torch.tensor([[[agent['ID']]]]).to(self.device)
-                            logp_list = self.local_net(task_info, total_agents, mask)
-                            action = torch.argmax(logp_list, 1)
-                            group, r = self.baseline_env.step(group, leader_id, action.item(), 0)
-                            self.baseline_env.task_update()
-                            self.baseline_env.agent_update()
-                self.baseline_env.finished = self.baseline_env.check_finished()
-
-        reward, finished_tasks = self.baseline_env.get_episode_reward(MAX_TIME)
+        self._greedy_policy_eval(self.baseline_env)
+        reward, _ = self.baseline_env.get_episode_reward(MAX_TIME)
         return reward
 
     def work(self, episode_number):
-        """
-        Interacts with the environment. The agent gets either gradients or experience buffer
-        """
         self.episode_number = episode_number
         self.perf_metrics = self.run_episode(episode_number)
 
@@ -275,27 +291,22 @@ class Worker:
             route[i] = [iterator + 1 for iterator in route[i]]
         route = dict(enumerate(route))
         import yaml
-        with open(f'route_ros_large.yaml', 'w') as f:
+        with open('route_ros_large.yaml', 'w') as f:
             yaml.dump(route, f, sort_keys=False)
 
     @staticmethod
     def zero_padding(a, max_len=AGENTS_RANGE[1]):
-        # torch zero padding
         return F.pad(a, (0, 0, 0, max_len - a.shape[1]), 'constant', -1)
 
     @staticmethod
     def true_padding(a, max_len=TASKS_RANGE[1]):
-        # torch true padding
         return F.pad(a, (0, max_len - a.shape[1]), 'constant', True)
-
 
 
 if __name__ == '__main__':
     device = torch.device('cpu')
-    # checkpoint = torch.load(model_path + '/checkpoint.pth')
     localNetwork = AttentionNet(AGENT_INPUT_DIM, TASK_INPUT_DIM, EMBEDDING_DIM).to(device)
-    # localNetwork.load_state_dict(checkpoint['model'])
-    for i in range(10):
-        worker = Worker(1, localNetwork, localNetwork, 0, device=device, seed=i, save_image=False)
+    for i in range(3):
+        worker = Worker(1, localNetwork, localNetwork, None, 0, device=device, seed=i, save_image=False)
         worker.run_episode(i)
         print(i)

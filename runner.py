@@ -61,8 +61,8 @@ class Runner(object):
     def testing(self, agents_range=AGENTS_RANGE, tasks_range=TASKS_RANGE, seed=None):
         worker = Worker(self.metaAgentID, self.localNetwork, self.localBaseline, self.localValue,
                         0, self.device, False, agents_num=agents_range, tasks_num=tasks_range, seed=seed)
-        reward = worker.baseline_test()
-        return reward
+        metrics = worker.baseline_test()
+        return metrics
 
     def comparison(self, testing_ep, sample, sample_number, env_params):
         worker = Worker(self.metaAgentID, self.localNetwork, self.localBaseline, self.localValue,

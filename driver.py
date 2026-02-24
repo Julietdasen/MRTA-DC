@@ -220,6 +220,98 @@ def take_batch(experience_buffer, batch_size):
     return rollouts
 
 
+def evaluate_policy_on_testset(policy_weights, test_set, test_agent_list=None):
+    # Reuse caller-provided actors when possible to avoid repeated actor startup overhead.
+    own_actors = test_agent_list is None
+    if own_actors:
+        test_agent_list = [RLRunner.remote(metaAgentID=i) for i in range(NUM_META_AGENT)]
+    try:
+        # Keep local policy/baseline weights aligned for deterministic eval semantics.
+        set_refs = []
+        for test_agent in test_agent_list:
+            set_refs.append(test_agent.set_weights.remote(policy_weights))
+            set_refs.append(test_agent.set_baseline_weights.remote(policy_weights))
+        ray.get(set_refs)
+
+        rows = []
+        for i in range(test_set.shape[0]):
+            sample_job_list = []
+            for j, test_agent in enumerate(test_agent_list):
+                sample_job_list.append(test_agent.testing.remote(seed=int(test_set[i][j])))
+            rows += ray.get(sample_job_list)
+        return rows
+    finally:
+        if own_actors:
+            for actor in test_agent_list:
+                ray.kill(actor)
+
+
+def summarize_eval_rows(rows):
+    if not rows:
+        empty = np.array([], dtype=np.float64)
+        return {
+            'reward': empty,
+            'makespan': empty,
+            'success_rate': empty,
+            'reward_mean': np.nan,
+            'makespan_mean': np.nan,
+            'success_rate_mean': np.nan,
+        }
+
+    reward = np.array([float(r.get('reward', np.nan)) for r in rows], dtype=np.float64)
+    makespan = np.array([float(r.get('makespan', np.nan)) for r in rows], dtype=np.float64)
+    success_rate = np.array([float(r.get('success_rate', np.nan)) for r in rows], dtype=np.float64)
+    return {
+        'reward': reward,
+        'makespan': makespan,
+        'success_rate': success_rate,
+        'reward_mean': float(np.nanmean(reward)),
+        'makespan_mean': float(np.nanmean(makespan)),
+        'success_rate_mean': float(np.nanmean(success_rate)),
+    }
+
+
+def paired_ttest_pvalue(a, b):
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    valid = np.isfinite(a) & np.isfinite(b)
+    if int(np.sum(valid)) < 2:
+        return None
+    _, p_value = ttest_rel(a[valid], b[valid])
+    if not np.isfinite(p_value):
+        return None
+    return float(p_value)
+
+
+def get_worker_weight_bundle(global_network, baseline_network, value_network, device, local_device):
+    if device != local_device:
+        weights = global_network.to(local_device).state_dict()
+        baseline_weights = baseline_network.to(local_device).state_dict()
+        value_weights = value_network.to(local_device).state_dict()
+        global_network.to(device)
+        baseline_network.to(device)
+        value_network.to(device)
+        return weights, baseline_weights, value_weights
+    return global_network.state_dict(), baseline_network.state_dict(), value_network.state_dict()
+
+
+def get_policy_weights(global_network, device, local_device):
+    if device != local_device:
+        weights = global_network.to(local_device).state_dict()
+        global_network.to(device)
+        return weights
+    return global_network.state_dict()
+
+
+def launch_training_jobs(meta_agents, weights, baseline_weights, value_weights, curr_episode, agents_num, tasks_num):
+    # Submit one rollout job per actor and advance episode counter in lockstep.
+    job_list = []
+    for meta_agent in meta_agents:
+        job_list.append(meta_agent.job.remote(weights, baseline_weights, value_weights, curr_episode, agents_num, tasks_num))
+        curr_episode += 1
+    return job_list, curr_episode
+
+
 def main():
     args = parse_args()
     run_dir = infer_run_dir()
@@ -284,6 +376,7 @@ def main():
     curr_episode = 0
     curr_level = 0
     best_perf = -100.0
+    best_makespan = float('inf')
     update_step = 0
 
     if LOAD_MODEL or os.getenv('DCMRTA_RESUME_CKPT', ''):
@@ -304,31 +397,25 @@ def main():
             curr_episode = checkpoint.get('episode', 0)
             curr_level = checkpoint.get('level', 0)
             best_perf = checkpoint.get('best_perf', best_perf)
+            best_makespan = float(checkpoint.get('best_makespan', best_makespan))
+            if np.isfinite(best_makespan):
+                best_perf = -best_makespan
             update_step = checkpoint.get('update_step', 0)
-            logger.info('Resumed | episode=%s | best_perf=%.6f', curr_episode, best_perf)
+            logger.info('Resumed | episode=%s | best_perf=%.6f | best_makespan=%s', curr_episode, best_perf, f'{best_makespan:.6f}' if np.isfinite(best_makespan) else 'NA')
         else:
             logger.warning('LOAD_MODEL enabled but no checkpoint found under %s', model_path)
 
     meta_agents = [RLRunner.remote(i) for i in range(NUM_META_AGENT)]
 
-    if device != local_device:
-        weights = global_network.to(local_device).state_dict()
-        baseline_weights = baseline_network.to(local_device).state_dict()
-        value_weights = value_network.to(local_device).state_dict()
-        global_network.to(device)
-        baseline_network.to(device)
-        value_network.to(device)
-    else:
-        weights = global_network.state_dict()
-        baseline_weights = baseline_network.state_dict()
-        value_weights = value_network.state_dict()
+    weights, baseline_weights, value_weights = get_worker_weight_bundle(
+        global_network, baseline_network, value_network, device, local_device
+    )
 
-    jobList = []
     agents_num = np.random.randint(AGENTS_RANGE[0], AGENTS_RANGE[1] + 1)
     tasks_num = np.random.randint(TASKS_RANGE[0], TASKS_RANGE[1] + 1)
-    for meta_agent in meta_agents:
-        jobList.append(meta_agent.job.remote(weights, baseline_weights, value_weights, curr_episode, agents_num, tasks_num))
-        curr_episode += 1
+    jobList, curr_episode = launch_training_jobs(
+        meta_agents, weights, baseline_weights, value_weights, curr_episode, agents_num, tasks_num
+    )
 
     metric_name = [
         'success_rate',
@@ -347,7 +434,7 @@ def main():
     training_rows = []
     experience_buffer = empty_experience_buffer()
     test_set = np.random.randint(low=0, high=1e8, size=[256 // NUM_META_AGENT, NUM_META_AGENT])
-    baseline_value = None
+    baseline_eval = None
 
     try:
         while True:
@@ -445,21 +532,14 @@ def main():
                 })
 
             if update_done:
-                if device != local_device:
-                    weights = global_network.to(local_device).state_dict()
-                    baseline_weights = baseline_network.to(local_device).state_dict()
-                    value_weights = value_network.to(local_device).state_dict()
-                    global_network.to(device)
-                    baseline_network.to(device)
-                    value_network.to(device)
-                else:
-                    weights = global_network.state_dict()
-                    baseline_weights = baseline_network.state_dict()
-                    value_weights = value_network.state_dict()
+                weights, baseline_weights, value_weights = get_worker_weight_bundle(
+                    global_network, baseline_network, value_network, device, local_device
+                )
 
-            for meta_agent in meta_agents:
-                jobList.append(meta_agent.job.remote(weights, baseline_weights, value_weights, curr_episode, agents_num, tasks_num))
-                curr_episode += 1
+            next_jobs, curr_episode = launch_training_jobs(
+                meta_agents, weights, baseline_weights, value_weights, curr_episode, agents_num, tasks_num
+            )
+            jobList += next_jobs
 
             if len(training_rows) >= SUMMARY_WINDOW:
                 summary = write_to_tensorboard(writer, training_rows, curr_episode)
@@ -508,6 +588,7 @@ def main():
                     'lr_decay': lr_decay.state_dict(),
                     'level': curr_level,
                     'best_perf': best_perf,
+                    'best_makespan': best_makespan,
                     'run_name': run_name,
                     'update_step': update_step,
                 }
@@ -515,62 +596,36 @@ def main():
                 logger.info('[CHECKPOINT] saved %s', ckpt_path)
 
             if EVALUATE and curr_episode % 1024 == 0:
-                ray.wait(jobList, num_returns=NUM_META_AGENT)
-                for actor in meta_agents:
-                    ray.kill(actor)
-                torch.cuda.empty_cache()
+                # Drain in-flight rollout jobs before running evaluation on the same actors.
+                ray.get(jobList)
+                jobList = []
                 logger.info('[EVAL] start ep=%d', curr_episode)
+                # Reuse the same actors for evaluation to avoid repeated actor init/teardown cost.
+                if baseline_eval is None:
+                    baseline_eval_rows = evaluate_policy_on_testset(baseline_weights, test_set, test_agent_list=meta_agents)
+                    baseline_eval = summarize_eval_rows(baseline_eval_rows)
+                test_eval_rows = evaluate_policy_on_testset(weights, test_set, test_agent_list=meta_agents)
+                test_eval = summarize_eval_rows(test_eval_rows)
 
-                if baseline_value is None:
-                    test_agent_list = [RLRunner.remote(metaAgentID=i) for i in range(NUM_META_AGENT)]
-                    for test_agent in test_agent_list:
-                        ray.get(test_agent.set_baseline_weights.remote(baseline_weights))
-                    rewards = []
-                    for i in range(256 // NUM_META_AGENT):
-                        sample_job_list = []
-                        for j, test_agent in enumerate(test_agent_list):
-                            sample_job_list.append(test_agent.testing.remote(seed=test_set[i][j]))
-                        sample_done_id, _ = ray.wait(sample_job_list, num_returns=NUM_META_AGENT)
-                        rewards += ray.get(sample_done_id)
-                    baseline_value = np.stack(rewards)
-                    for actor in test_agent_list:
-                        ray.kill(actor)
+                test_reward_mean = test_eval['reward_mean']
+                baseline_reward_mean = baseline_eval['reward_mean']
+                test_makespan_mean = test_eval['makespan_mean']
+                baseline_makespan_mean = baseline_eval['makespan_mean']
 
-                test_agent_list = [RLRunner.remote(metaAgentID=i) for i in range(NUM_META_AGENT)]
-                for test_agent in test_agent_list:
-                    ray.get(test_agent.set_baseline_weights.remote(weights))
-                rewards = []
-                for i in range(256 // NUM_META_AGENT):
-                    sample_job_list = []
-                    for j, test_agent in enumerate(test_agent_list):
-                        sample_job_list.append(test_agent.testing.remote(seed=test_set[i][j]))
-                    sample_done_id, _ = ray.wait(sample_job_list, num_returns=NUM_META_AGENT)
-                    rewards += ray.get(sample_done_id)
-                test_value = np.stack(rewards)
-                for actor in test_agent_list:
-                    ray.kill(actor)
-
-                meta_agents = [RLRunner.remote(i) for i in range(NUM_META_AGENT)]
-
-                test_mean = float(test_value.mean())
-                baseline_mean = float(baseline_value.mean())
-                p_value = None
+                makespan_p_value = None
+                reward_p_value = paired_ttest_pvalue(test_eval['reward'], baseline_eval['reward'])
                 best_updated = False
 
-                if test_mean > baseline_mean:
-                    _, p = ttest_rel(test_value, baseline_value)
-                    p_value = float(p)
-                    if p < 0.05:
-                        if device != local_device:
-                            weights = global_network.to(local_device).state_dict()
-                            global_network.to(device)
-                        else:
-                            weights = global_network.state_dict()
+                if test_makespan_mean < baseline_makespan_mean:
+                    makespan_p_value = paired_ttest_pvalue(test_eval['makespan'], baseline_eval['makespan'])
+                    if makespan_p_value is not None and makespan_p_value < 0.05:
+                        weights = get_policy_weights(global_network, device, local_device)
                         baseline_weights = copy.deepcopy(weights)
                         baseline_network.load_state_dict(baseline_weights)
                         test_set = np.random.randint(low=0, high=1e8, size=[256 // NUM_META_AGENT, NUM_META_AGENT])
-                        baseline_value = None
-                        best_perf = test_mean
+                        baseline_eval = None
+                        best_makespan = float(test_makespan_mean)
+                        best_perf = -best_makespan
                         checkpoint = {
                             'model': global_network.state_dict(),
                             'baseline_model': baseline_network.state_dict(),
@@ -580,6 +635,7 @@ def main():
                             'episode': curr_episode,
                             'lr_decay': lr_decay.state_dict(),
                             'best_perf': best_perf,
+                            'best_makespan': best_makespan,
                             'run_name': run_name,
                             'update_step': update_step,
                         }
@@ -588,39 +644,42 @@ def main():
                         best_updated = True
 
                 logger.info(
-                    '[EVAL] ep=%d test_mean=%.6f baseline_mean=%.6f p_value=%s best_updated=%s',
+                    '[EVAL] ep=%d reward(test/base)=%.6f/%.6f makespan(test/base)=%.6f/%.6f '
+                    'p_makespan=%s p_reward=%s best_updated=%s',
                     curr_episode,
-                    test_mean,
-                    baseline_mean,
-                    f'{p_value:.6f}' if p_value is not None else 'NA',
+                    test_reward_mean,
+                    baseline_reward_mean,
+                    test_makespan_mean,
+                    baseline_makespan_mean,
+                    f'{makespan_p_value:.6f}' if makespan_p_value is not None else 'NA',
+                    f'{reward_p_value:.6f}' if reward_p_value is not None else 'NA',
                     best_updated,
                 )
                 append_jsonl(eval_metrics_jsonl, {
                     'timestamp': datetime.now().isoformat(timespec='seconds'),
                     'episode': curr_episode,
-                    'test_mean': test_mean,
-                    'baseline_mean': baseline_mean,
-                    'p_value': p_value,
+                    'test_mean': float(test_reward_mean),
+                    'baseline_mean': float(baseline_reward_mean),
+                    'test_reward_mean': float(test_reward_mean),
+                    'baseline_reward_mean': float(baseline_reward_mean),
+                    'test_makespan_mean': float(test_makespan_mean),
+                    'baseline_makespan_mean': float(baseline_makespan_mean),
+                    'p_value': makespan_p_value,
+                    'p_value_makespan': makespan_p_value,
+                    'p_value_reward': reward_p_value,
                     'best_updated': best_updated,
+                    'best_makespan': float(best_makespan) if np.isfinite(best_makespan) else None,
                     'best_perf': float(best_perf),
                 })
 
-                if device != local_device:
-                    weights = global_network.to(local_device).state_dict()
-                    baseline_weights = baseline_network.to(local_device).state_dict()
-                    value_weights = value_network.to(local_device).state_dict()
-                    global_network.to(device)
-                    baseline_network.to(device)
-                    value_network.to(device)
-                else:
-                    weights = global_network.state_dict()
-                    baseline_weights = baseline_network.state_dict()
-                    value_weights = value_network.state_dict()
+                weights, baseline_weights, value_weights = get_worker_weight_bundle(
+                    global_network, baseline_network, value_network, device, local_device
+                )
 
-                jobList = []
-                for meta_agent in meta_agents:
-                    jobList.append(meta_agent.job.remote(weights, baseline_weights, value_weights, curr_episode, agents_num, tasks_num))
-                    curr_episode += 1
+                # Resume rollout collection immediately after eval with fresh/global weights.
+                jobList, curr_episode = launch_training_jobs(
+                    meta_agents, weights, baseline_weights, value_weights, curr_episode, agents_num, tasks_num
+                )
 
     except KeyboardInterrupt:
         logger.info('KeyboardInterrupt detected, stopping training')

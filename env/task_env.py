@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 from matplotlib import patches
 from matplotlib.animation import FuncAnimation
 from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+from scheduler.online_dispatcher import DispatchContext, OnlineDispatcher
 
 
 class TaskEnv:
@@ -11,7 +12,8 @@ class TaskEnv:
                  reward_w_makespan=1.0, reward_w_travel=0.05, reward_w_wait=0.1, reward_w_mode=0.05,
                  enable_commit_lock=True, min_commit_time=2.0, enable_quorum_protect=True,
                  switch_penalty=0.15, quorum_break_penalty=0.5, pause_event_penalty=0.2,
-                 use_dense_event_reward=True, use_potential_shaping=True, potential_shaping_coef=1.0):
+                 use_dense_event_reward=True, use_potential_shaping=True, potential_shaping_coef=1.0,
+                 online_dispatcher=None):
         """
         :param traits_dim: number of capabilities in this problem, e.g. 3 traits
         :param seed: seed to generate pseudo random problem instance
@@ -40,6 +42,7 @@ class TaskEnv:
         self.use_dense_event_reward = bool(use_dense_event_reward)
         self.use_potential_shaping = bool(use_potential_shaping)
         self.potential_shaping_coef = float(potential_shaping_coef)
+        self.online_dispatcher = online_dispatcher
         if seed is not None:
             self.rng = np.random.default_rng(seed)
         self.traits_dim = traits_dim
@@ -65,6 +68,14 @@ class TaskEnv:
         self._reward_snapshot = None
         self._event_snapshot = None
         self.reset_dense_reward_snapshot()
+
+    def set_online_dispatcher(self, dispatcher):
+        if dispatcher is None:
+            self.online_dispatcher = None
+            return
+        if not isinstance(dispatcher, OnlineDispatcher) and not callable(getattr(dispatcher, 'select_members', None)):
+            raise TypeError('dispatcher must implement OnlineDispatcher')
+        self.online_dispatcher = dispatcher
 
     def random_int(self, low, high, size=None):
         if self.rng is not None:
@@ -821,25 +832,68 @@ class TaskEnv:
         return - travel_time
 
     def step(self, group, leader_id, action, current_action_index=0):
-        if action - 1 in self.task_dic.keys():
-            vacancy = int(np.maximum(1, np.ceil(np.sum(self.task_dic[action - 1]['status']))))
-        else:
-            vacancy = len(group)
-        group.remove(leader_id)
-        available_agents = len(group)
-        if vacancy > 1:
-            followers = self.random_choice(group, np.minimum(vacancy - 1, available_agents), False).tolist()
-            for follower in followers:
-                group.remove(follower)
-            members = [leader_id] + followers
-        else:
-            members = [leader_id]
+        vacancy = self._resolve_vacancy(action, group)
+        members = self._resolve_members(group, leader_id, action, vacancy)
         reward = 0
         for member in members:
             reward += self.agent_step(member, action)
             self.agent_dic[member]['current_action_index'] = current_action_index
         reward = reward / len(members)
         return group, reward
+
+    def _resolve_vacancy(self, action, group):
+        if action - 1 in self.task_dic.keys():
+            return int(np.maximum(1, np.ceil(np.sum(self.task_dic[action - 1]['status']))))
+        return int(len(group))
+
+    def _resolve_members(self, group, leader_id, action, vacancy):
+        group_copy = list(group)
+        if leader_id in group_copy:
+            group_copy.remove(leader_id)
+
+        if self.online_dispatcher is not None:
+            # Dispatcher mode: keep this branch as the single extension point for online lower-level scheduling.
+            context = DispatchContext(
+                leader_id=int(leader_id),
+                action=int(action),
+                vacancy=int(vacancy),
+                group=list(group),
+            )
+            selected = self.online_dispatcher.select_members(context, self)
+            selected = [int(x) for x in selected]
+            members = self._sanitize_selected_members(selected, group, leader_id)
+        else:
+            # Baseline-compatible fallback: random followers based on current vacancy.
+            members = [int(leader_id)]
+            if vacancy > 1 and len(group_copy) > 0:
+                followers = self.random_choice(group_copy, np.minimum(vacancy - 1, len(group_copy)), False).tolist()
+                members += [int(x) for x in followers]
+
+        for member in members:
+            if member in group:
+                group.remove(member)
+        return members
+
+    @staticmethod
+    def _sanitize_selected_members(selected, group, leader_id):
+        valid = set(group)
+        members = []
+        if leader_id in valid:
+            members.append(int(leader_id))
+        for aid in selected:
+            if aid == leader_id:
+                continue
+            if aid not in valid:
+                continue
+            if aid in members:
+                continue
+            members.append(int(aid))
+        if not members:
+            if leader_id in valid:
+                members = [int(leader_id)]
+            elif len(group) > 0:
+                members = [int(group[0])]
+        return members
 
     def calculate_waiting_time(self):
         for agent in self.agent_dic.values():

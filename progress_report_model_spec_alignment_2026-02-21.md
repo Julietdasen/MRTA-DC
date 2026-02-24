@@ -436,3 +436,81 @@
   1. 运行短训（建议 20k episode）验证新指标是否达标。  
   2. 按结果微调 `SWITCH_PENALTY / QUORUM_BREAK_PENALTY / MIN_COMMIT_TIME`。  
   3. 达标后再进入 v0.4 上下层接口融合。  
+
+## 14. 2026-02-25 v0.4 预留接口与工程精简（本轮）
+
+### 14.1 本轮目标
+
+1. 将模型选择改为 `makespan-first`。  
+2. 预留在线下层调度接口，但默认保持 baseline 组队行为。  
+3. 对主链路做去重精简，降低冗杂度并提高可维护性。  
+
+### 14.2 新增设计文档
+
+- `model_spec_mrta_dynamic_coalition_v0_4_design.md`
+
+覆盖内容：
+
+- 在线 dispatcher 接口 contract
+- makespan-first 评估/选模
+- 主链路精简与后续 v0.5 入口
+
+### 14.3 已落地代码变更
+
+1. `driver.py`（选模与评估链路）
+- 评估改为 makespan-first：
+  - 主判据：`test_makespan_mean < baseline_makespan_mean`
+  - 显著性：paired t-test on makespan
+- 保留 reward 统计，但不再作为 best 更新主判据
+- 新增字段：
+  - `best_makespan`
+  - `p_value_makespan`
+  - `p_value_reward`
+- 去重函数新增：
+  - `evaluate_policy_on_testset`
+  - `summarize_eval_rows`
+  - `paired_ttest_pvalue`
+  - `get_worker_weight_bundle`
+  - `get_policy_weights`
+  - `launch_training_jobs`
+- 评估效率优化：
+  - baseline/test 评估复用同一组 actors，减少重复创建开销
+  - eval 过程复用训练 actors，不再每次 eval 后 kill/recreate actors
+
+2. `worker.py` / `runner.py`（评估输出）
+- `baseline_test()` 改为返回结构化指标字典（`reward/makespan/success_rate`）。
+- `runner.testing()` 同步返回指标字典，配合 driver 的 makespan-first 逻辑。
+- 抽取 `_collect_perf_metrics()` 统一收集指标，减少 `run_episode/run_test/run_test_IS` 重复。
+- 增加注释，明确指标收集函数是唯一 schema 维护点。
+
+3. `env/task_env.py` + `scheduler/`（在线调度接口预留）
+- 新增 `scheduler/online_dispatcher.py`：
+  - `DispatchContext`
+  - `OnlineDispatcher`
+  - `BaselineRandomDispatcher`
+- `TaskEnv` 新增 `online_dispatcher` 注入点与 `set_online_dispatcher()`
+- `step()` 新增：
+  - `_resolve_vacancy()`
+  - `_resolve_members()`
+  - `_sanitize_selected_members()`
+- 默认行为不变：未启用 dispatcher 时仍走 baseline 随机组队。
+- 增加注释说明 dispatcher 分支是在线下层调度唯一扩展点。
+
+4. `parameters.py`
+- 新增预留参数：
+  - `ENABLE_ONLINE_DISPATCH`
+  - `ONLINE_DISPATCH_POLICY`
+
+### 14.4 本轮验证
+
+已执行语法检查：
+
+- `python -m py_compile driver.py runner.py worker.py env/task_env.py scheduler/online_dispatcher.py`
+
+结果：通过。
+
+### 14.5 当前结论
+
+1. 选模目标已和“makespan 主目标”对齐。  
+2. 在线下层调度接口已完成最小侵入预留，可在不改上层策略结构的前提下迭代。  
+3. 主链路冗杂度已下降，后续继续做性能型优化（如 actor 复用、评估并发调度优化）风险更可控。  

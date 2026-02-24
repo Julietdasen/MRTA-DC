@@ -7,6 +7,7 @@ from torch.nn import functional as F
 from attention import AttentionNet
 from env.task_env import TaskEnv
 from parameters import *
+from scheduler.online_dispatcher import BaselineRandomDispatcher
 
 
 class Worker:
@@ -27,6 +28,9 @@ class Worker:
         self.metaAgentID = mete_agent_id
         self.global_step = global_step
         self.save_image = save_image
+        online_dispatcher = None
+        if ENABLE_ONLINE_DISPATCH and ONLINE_DISPATCH_POLICY == 'baseline_random':
+            online_dispatcher = BaselineRandomDispatcher()
         self.env = TaskEnv(
             agents_num,
             tasks_num,
@@ -50,6 +54,7 @@ class Worker:
             use_dense_event_reward=USE_DENSE_EVENT_REWARD,
             use_potential_shaping=USE_POTENTIAL_SHAPING,
             potential_shaping_coef=POTENTIAL_SHAPING_COEF,
+            online_dispatcher=online_dispatcher,
         )
         self.baseline_env = copy.deepcopy(self.env)
         self.local_net = local_network
@@ -95,6 +100,24 @@ class Worker:
                 action = valid_logp.argmax(dim=-1)
                 break
         return action
+
+    @staticmethod
+    def _collect_perf_metrics(env, reward, finished_tasks):
+        # Keep all rollout/test metric assembly in one place so schema changes are low-risk.
+        perf_metrics = {
+            'success_rate': float(np.sum(finished_tasks) / len(finished_tasks)),
+            'makespan': float(env.current_time),
+            'time_cost': float(np.nanmean(env.get_matrix(env.task_dic, 'time_start'))),
+            'waiting_time': float(np.mean(env.get_matrix(env.agent_dic, 'sum_waiting_time'))),
+            'travel_dist': float(np.sum(env.get_matrix(env.agent_dic, 'travel_dist'))),
+            'reward': float(reward),
+        }
+        util_exec, util_wait, util_travel = env.get_utilization_metrics()
+        perf_metrics['utilization_exec'] = float(util_exec)
+        perf_metrics['utilization_wait'] = float(util_wait)
+        perf_metrics['utilization_travel'] = float(util_travel)
+        perf_metrics['efficiency'] = float(util_exec)
+        return perf_metrics
 
     def run_episode(self, episode_number):
         episode = {
@@ -170,20 +193,8 @@ class Worker:
                 episode['advantages'].append(torch.tensor([[float(adv)]], dtype=torch.float32, device=self.device))
                 episode['returns'].append(torch.tensor([[float(ret)]], dtype=torch.float32, device=self.device))
 
-        perf_metrics = {
-            'success_rate': float(np.sum(finished_tasks) / len(finished_tasks)),
-            'makespan': float(self.env.current_time),
-            'time_cost': float(np.nanmean(self.env.get_matrix(self.env.task_dic, 'time_start'))),
-            'waiting_time': float(np.mean(self.env.get_matrix(self.env.agent_dic, 'sum_waiting_time'))),
-            'travel_dist': float(np.sum(self.env.get_matrix(self.env.agent_dic, 'travel_dist'))),
-            'reward': float(reward),
-            'episode_steps': float(len(episode['rewards'])),
-        }
-        util_exec, util_wait, util_travel = self.env.get_utilization_metrics()
-        perf_metrics['utilization_exec'] = float(util_exec)
-        perf_metrics['utilization_wait'] = float(util_wait)
-        perf_metrics['utilization_travel'] = float(util_travel)
-        perf_metrics['efficiency'] = float(util_exec)
+        perf_metrics = self._collect_perf_metrics(self.env, reward, finished_tasks)
+        perf_metrics['episode_steps'] = float(len(episode['rewards']))
         perf_metrics.update(self.env.get_behavior_metrics())
 
         if self.save_image:
@@ -217,28 +228,16 @@ class Worker:
                 env.finished = env.check_finished()
 
     def run_test(self, test_episode, test_env, image_path=None):
-        perf_metrics = {}
         self.baseline_env = copy.copy(test_env)
         self.baseline_env.plot_figure = False
         self._greedy_policy_eval(self.baseline_env)
-        _, finished_tasks = self.baseline_env.get_episode_reward(MAX_TIME)
-
-        perf_metrics['success_rate'] = float(np.sum(finished_tasks) / len(finished_tasks))
-        perf_metrics['makespan'] = float(self.baseline_env.current_time)
-        perf_metrics['time_cost'] = float(np.nanmean(self.baseline_env.get_matrix(self.baseline_env.task_dic, 'time_start')))
-        perf_metrics['waiting_time'] = float(np.mean(self.baseline_env.get_matrix(self.baseline_env.agent_dic, 'sum_waiting_time')))
-        perf_metrics['travel_dist'] = float(np.sum(self.baseline_env.get_matrix(self.baseline_env.agent_dic, 'travel_dist')))
-        util_exec, util_wait, util_travel = self.baseline_env.get_utilization_metrics()
-        perf_metrics['utilization_exec'] = float(util_exec)
-        perf_metrics['utilization_wait'] = float(util_wait)
-        perf_metrics['utilization_travel'] = float(util_travel)
-        perf_metrics['efficiency'] = float(util_exec)
+        reward, finished_tasks = self.baseline_env.get_episode_reward(MAX_TIME)
+        perf_metrics = self._collect_perf_metrics(self.baseline_env, reward, finished_tasks)
         if image_path is not None:
             self.baseline_env.plot_animation(image_path, 'RL')
         return perf_metrics
 
     def run_test_IS(self, test_episode, test_env):
-        perf_metrics = {}
         self.baseline_env = copy.copy(test_env)
         self.baseline_env.plot_figure = False
 
@@ -262,24 +261,18 @@ class Worker:
                     self.baseline_env.agent_update()
                 self.baseline_env.finished = self.baseline_env.check_finished()
 
-        _, finished_tasks = self.baseline_env.get_episode_reward(MAX_TIME)
-        perf_metrics['success_rate'] = float(np.sum(finished_tasks) / len(finished_tasks))
-        perf_metrics['makespan'] = float(self.baseline_env.current_time)
-        perf_metrics['time_cost'] = float(np.nanmean(self.baseline_env.get_matrix(self.baseline_env.task_dic, 'time_start')))
-        perf_metrics['waiting_time'] = float(np.mean(self.baseline_env.get_matrix(self.baseline_env.agent_dic, 'sum_waiting_time')))
-        perf_metrics['travel_dist'] = float(np.sum(self.baseline_env.get_matrix(self.baseline_env.agent_dic, 'travel_dist')))
-        util_exec, util_wait, util_travel = self.baseline_env.get_utilization_metrics()
-        perf_metrics['utilization_exec'] = float(util_exec)
-        perf_metrics['utilization_wait'] = float(util_wait)
-        perf_metrics['utilization_travel'] = float(util_travel)
-        perf_metrics['efficiency'] = float(util_exec)
-        return perf_metrics
+        reward, finished_tasks = self.baseline_env.get_episode_reward(MAX_TIME)
+        return self._collect_perf_metrics(self.baseline_env, reward, finished_tasks)
 
     def baseline_test(self):
         self.baseline_env.plot_figure = False
         self._greedy_policy_eval(self.baseline_env)
-        reward, _ = self.baseline_env.get_episode_reward(MAX_TIME)
-        return reward
+        reward, finished_tasks = self.baseline_env.get_episode_reward(MAX_TIME)
+        return {
+            'reward': float(reward),
+            'makespan': float(self.baseline_env.current_time),
+            'success_rate': float(np.sum(finished_tasks) / len(finished_tasks)),
+        }
 
     def work(self, episode_number):
         self.episode_number = episode_number

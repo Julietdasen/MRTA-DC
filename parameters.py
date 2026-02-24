@@ -45,6 +45,10 @@ USE_DENSE_EVENT_REWARD = True
 USE_POTENTIAL_SHAPING = True
 POTENTIAL_SHAPING_COEF = 1.0
 
+# v0.4 online dispatch interface reservation (default keeps baseline behavior unchanged)
+ENABLE_ONLINE_DISPATCH = False
+ONLINE_DISPATCH_POLICY = 'baseline_random'
+
 # v0.3 critic + GAE settings
 USE_CRITIC = True
 GAE_LAMBDA = 0.95

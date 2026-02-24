@@ -58,9 +58,11 @@ def setup_logger(log_file):
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
 
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
+    disable_file_log = os.getenv('DCMRTA_DISABLE_FILE_LOG', '').strip().lower() in {'1', 'true', 'yes', 'on'}
+    if not disable_file_log:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
     return logger
 
 

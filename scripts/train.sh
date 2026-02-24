@@ -10,7 +10,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ALGO_NAME="${ALGO_NAME:-REINFORCE}"
 RUN_ROOT="${RUN_ROOT:-${PROJECT_ROOT}/runs}"
 RUN_TAG="${RUN_TAG:-baseline}"
-RUN_COMMENT="${RUN_COMMENT:-manual_run}"
+RUN_COMMENT="${RUN_COMMENT:-manual_run_with_v0_3}" # 这里可以添加一些备注信息，比如实验的目的、使用的数据集等，方便后续回顾和分析
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DRIVER_PATH="${DRIVER_PATH:-${PROJECT_ROOT}/driver.py}"
 
@@ -58,6 +58,8 @@ export DCMRTA_RUN_COMMENT="${RUN_COMMENT}"
 export DCMRTA_MODEL_PATH="${MODEL_DIR}"
 export DCMRTA_TRAIN_PATH="${TB_DIR}"
 export DCMRTA_GIFS_PATH="${GIF_DIR}"
+# train.sh uses tee to persist logs, so disable logger file handler to avoid duplicate lines.
+export DCMRTA_DISABLE_FILE_LOG="${DCMRTA_DISABLE_FILE_LOG:-1}"
 if [[ -n "${RESUME_CKPT}" ]]; then
   export DCMRTA_RESUME_CKPT="${RESUME_CKPT}"
 fi

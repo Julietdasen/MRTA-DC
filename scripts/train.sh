@@ -8,6 +8,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # User editable settings
 # -----------------------------
 ALGO_NAME="${ALGO_NAME:-REINFORCE}"
+TRAIN_ALGO="${TRAIN_ALGO:-${ALGO_NAME}}"
 RUN_ROOT="${RUN_ROOT:-${PROJECT_ROOT}/runs}"
 RUN_TAG="${RUN_TAG:-baseline}"
 RUN_COMMENT="${RUN_COMMENT:-manual_run_with_v0_3}" # 这里可以添加一些备注信息，比如实验的目的、使用的数据集等，方便后续回顾和分析
@@ -46,6 +47,7 @@ echo "Run dir:  ${RUN_DIR}"
 echo "Model:    ${MODEL_DIR}"
 echo "TensorBoard: ${TB_DIR}"
 echo "Log file: ${LOG_DIR}/train.log"
+echo "Train algo: ${TRAIN_ALGO}"
 
 if [[ -n "${RESUME_CKPT}" ]]; then
   echo "Resume checkpoint: ${RESUME_CKPT}"
@@ -58,6 +60,7 @@ export DCMRTA_RUN_COMMENT="${RUN_COMMENT}"
 export DCMRTA_MODEL_PATH="${MODEL_DIR}"
 export DCMRTA_TRAIN_PATH="${TB_DIR}"
 export DCMRTA_GIFS_PATH="${GIF_DIR}"
+export DCMRTA_ALGO="$(echo "${TRAIN_ALGO}" | tr '[:upper:]' '[:lower:]')"
 # train.sh uses tee to persist logs, so disable logger file handler to avoid duplicate lines.
 export DCMRTA_DISABLE_FILE_LOG="${DCMRTA_DISABLE_FILE_LOG:-1}"
 if [[ -n "${RESUME_CKPT}" ]]; then
@@ -72,6 +75,7 @@ fi
   echo "run_dir=${RUN_DIR}"
   echo "run_tag=${RUN_TAG}"
   echo "run_comment=${RUN_COMMENT}"
+  echo "train_algo=${TRAIN_ALGO}"
   echo "python_bin=${PYTHON_BIN}"
   echo "driver_path=${DRIVER_PATH}"
   echo "resume_ckpt=${RESUME_CKPT}"

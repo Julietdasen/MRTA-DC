@@ -1,7 +1,7 @@
-# 同构多机器人 MRTA（在线下层调度接口 + 工程精简）v0.4 设计
+# 同构多机器人 MRTA（在线下层调度接口 + PPO 引入）v0.4 设计
 
 更新时间：2026-02-25  
-目标：在保持 v0.3 行为语义不回退的前提下，预留在线下层调度接口，并降低训练主链路复杂度。
+目标：在保持 v0.3 行为语义不回退的前提下，预留在线下层调度接口，并引入可切换 PPO 训练分支。
 
 ---
 
@@ -13,12 +13,14 @@
 - 默认策略保持 baseline 组队逻辑（行为兼容）
 - 训练/评估主链路去重与代码精简
 - makespan-first 模型选择落地
+- 算法可切换：`reinforce` / `ppo`
 
 ### 1.2 Out of Scope
 
 - 不引入完整在线 mTSP/MILP 求解器
 - 不改 actor/critic 网络结构
 - 不改变现有 reward 的数学定义
+- 不引入 MAPPO（本轮仅实现 PPO）
 
 ---
 
@@ -130,3 +132,44 @@
 1. 在 dispatcher 中新增 `greedy_eta` 策略（轻量在线调度）
 2. 定义统一 `dispatch debug trace`（便于分析 coalition 行为）
 3. 将 dispatcher 接口逐步与 baseline 的 OR/CTAS 局部重规划能力对齐
+
+---
+
+## 7. PPO 引入（本轮新增）
+
+### 7.1 目标
+
+在不破坏现有 REINFORCE 训练链路的前提下，增加 PPO 选项以降低策略更新震荡。
+
+### 7.2 参数接口
+
+`parameters.py`：
+
+- `ALGO`：`reinforce` / `ppo`
+- `PPO_EPOCHS`
+- `PPO_MINIBATCH_SIZE`
+- `PPO_CLIP_EPS`
+- `PPO_VALUE_CLIP_EPS`
+- `PPO_TARGET_KL`
+
+`scripts/train.sh`：
+
+- 新增 `TRAIN_ALGO`，并通过环境变量下发 `DCMRTA_ALGO`
+- 可直接命令行切换：
+  - `TRAIN_ALGO=ppo ALGO_NAME=PPO bash scripts/train.sh`
+
+### 7.3 训练实现
+
+`driver.py`：
+
+- 保留 `reinforce` 路径
+- 新增 `ppo_update(...)`：
+  - clipped policy objective
+  - value clipping（可配置）
+  - mini-batch + multi-epoch 更新
+  - KL early-stop（`PPO_TARGET_KL`）
+
+### 7.4 兼容性说明
+
+- 默认 `ALGO='reinforce'`，历史实验行为不变
+- PPO 为增量分支，不影响已有 checkpoint 结构读取

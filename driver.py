@@ -151,6 +151,104 @@ def entropy_coef_by_step(step):
     return float(ENTROPY_COEF_START + (ENTROPY_COEF_END - ENTROPY_COEF_START) * ratio)
 
 
+def normalize_advantages(advantage_batch):
+    adv_mean = advantage_batch.mean()
+    adv_std = advantage_batch.std(unbiased=False)
+    norm_adv = (advantage_batch - adv_mean) / (adv_std + 1e-8)
+    norm_adv = torch.clamp(norm_adv, min=-5.0, max=5.0)
+    return norm_adv, adv_std
+
+
+def ppo_update(
+    global_network,
+    value_network,
+    global_optimizer,
+    value_optimizer,
+    task_inputs,
+    agent_inputs,
+    action_batch,
+    mask_batch,
+    norm_adv,
+    return_batch,
+    global_feat_batch,
+    update_step,
+):
+    with torch.no_grad():
+        old_logp_list = global_network(task_inputs, agent_inputs, mask_batch)
+        old_logp = torch.gather(old_logp_list, 1, action_batch.long())
+        old_value_pred = value_network(global_feat_batch)
+
+    batch_size = int(action_batch.shape[0])
+    minibatch_size = int(max(1, min(PPO_MINIBATCH_SIZE, batch_size)))
+    policy_losses = []
+    value_losses = []
+    entropy_vals = []
+    grad_vals = []
+    early_stop = False
+
+    for _ in range(PPO_EPOCHS):
+        perm = torch.randperm(batch_size, device=action_batch.device)
+        for start in range(0, batch_size, minibatch_size):
+            idx = perm[start:start + minibatch_size]
+
+            curr_logp_list = global_network(task_inputs[idx], agent_inputs[idx], mask_batch[idx])
+            curr_logp = torch.gather(curr_logp_list, 1, action_batch[idx].long())
+            entropy = -(curr_logp_list.exp() * curr_logp_list).nansum(dim=-1).mean()
+
+            log_ratio = curr_logp - old_logp[idx]
+            ratio = torch.exp(log_ratio)
+            surr1 = ratio * norm_adv[idx].detach()
+            surr2 = torch.clamp(ratio, 1.0 - PPO_CLIP_EPS, 1.0 + PPO_CLIP_EPS) * norm_adv[idx].detach()
+            policy_loss = -torch.min(surr1, surr2).mean()
+
+            value_pred = value_network(global_feat_batch[idx])
+            if PPO_VALUE_CLIP_EPS > 0:
+                value_old = old_value_pred[idx]
+                value_clipped = value_old + torch.clamp(value_pred - value_old, -PPO_VALUE_CLIP_EPS, PPO_VALUE_CLIP_EPS)
+                value_loss_unclipped = (value_pred - return_batch[idx]) ** 2
+                value_loss_clipped = (value_clipped - return_batch[idx]) ** 2
+                value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
+            else:
+                value_loss = torch.nn.functional.mse_loss(value_pred, return_batch[idx])
+
+            ent_coef = entropy_coef_by_step(update_step)
+            total_loss = policy_loss + VALUE_COEF * value_loss - ent_coef * entropy
+
+            global_optimizer.zero_grad()
+            value_optimizer.zero_grad()
+            total_loss.backward()
+            grad_norm_actor = torch.nn.utils.clip_grad_norm_(global_network.parameters(), max_norm=MAX_GRAD_NORM, norm_type=2)
+            grad_norm_value = torch.nn.utils.clip_grad_norm_(value_network.parameters(), max_norm=MAX_GRAD_NORM, norm_type=2)
+            global_optimizer.step()
+            value_optimizer.step()
+            update_step += 1
+
+            policy_losses.append(float(policy_loss.item()))
+            value_losses.append(float(value_loss.item()))
+            entropy_vals.append(float(entropy.item()))
+            grad_vals.append(float(max(grad_norm_actor.item(), grad_norm_value.item())))
+
+            if PPO_TARGET_KL > 0:
+                approx_kl = float((old_logp[idx] - curr_logp.detach()).mean().item())
+                if approx_kl > PPO_TARGET_KL:
+                    early_stop = True
+                    break
+        if early_stop:
+            break
+
+    with torch.no_grad():
+        final_value_pred = value_network(global_feat_batch)
+    ev = explained_variance(final_value_pred.detach(), return_batch.detach())
+    return {
+        'policy_loss': float(np.mean(policy_losses)) if policy_losses else np.nan,
+        'value_loss': float(np.mean(value_losses)) if value_losses else np.nan,
+        'entropy': float(np.mean(entropy_vals)) if entropy_vals else np.nan,
+        'grad_norm': float(np.mean(grad_vals)) if grad_vals else np.nan,
+        'explained_var': float(ev),
+        'update_step': update_step,
+    }
+
+
 def explained_variance(y_pred, y_true):
     var_y = float(torch.var(y_true, unbiased=False).item())
     if var_y < 1e-8:
@@ -369,6 +467,16 @@ def main():
     global_optimizer = optim.Adam(global_network.parameters(), lr=LR)
     value_optimizer = optim.Adam(value_network.parameters(), lr=LR)
     lr_decay = optim.lr_scheduler.StepLR(global_optimizer, step_size=DECAY_STEP, gamma=0.98)
+    algo_name = str(ALGO).strip().lower()
+    if algo_name not in {'reinforce', 'ppo'}:
+        raise ValueError(f'Unsupported ALGO={ALGO}. Expected one of: reinforce, ppo')
+    logger.info(
+        'Training setup | algo=%s | ppo_epochs=%s | ppo_minibatch=%s | ppo_clip=%.4f',
+        algo_name,
+        PPO_EPOCHS,
+        PPO_MINIBATCH_SIZE,
+        PPO_CLIP_EPS,
+    )
 
     if WANDB_LOG:
         wandb.watch(global_network)
@@ -493,39 +601,63 @@ def main():
                     global_feat_batch = global_feat_batch.to(device)
                     reward_batch = reward_batch.to(device)
 
-                adv_mean = advantage_batch.mean()
-                adv_std = advantage_batch.std(unbiased=False)
-                norm_adv = (advantage_batch - adv_mean) / (adv_std + 1e-8)
-                norm_adv = torch.clamp(norm_adv, min=-5.0, max=5.0)
+                norm_adv, adv_std = normalize_advantages(advantage_batch)
 
-                logp_list = global_network(task_inputs, agent_inputs, mask_batch)
-                logp = torch.gather(logp_list, 1, action_batch.long())
-                entropy = -(logp_list.exp() * logp_list).nansum(dim=-1).mean()
-                policy_loss = (-logp * norm_adv.detach()).mean()
+                if algo_name == 'ppo':
+                    update_stats = ppo_update(
+                        global_network=global_network,
+                        value_network=value_network,
+                        global_optimizer=global_optimizer,
+                        value_optimizer=value_optimizer,
+                        task_inputs=task_inputs,
+                        agent_inputs=agent_inputs,
+                        action_batch=action_batch,
+                        mask_batch=mask_batch,
+                        norm_adv=norm_adv,
+                        return_batch=return_batch,
+                        global_feat_batch=global_feat_batch,
+                        update_step=update_step,
+                    )
+                    update_step = int(update_stats['update_step'])
+                    policy_loss_value = update_stats['policy_loss']
+                    value_loss_value = update_stats['value_loss']
+                    entropy_value = update_stats['entropy']
+                    grad_norm_value = update_stats['grad_norm']
+                    ev = update_stats['explained_var']
+                else:
+                    logp_list = global_network(task_inputs, agent_inputs, mask_batch)
+                    logp = torch.gather(logp_list, 1, action_batch.long())
+                    entropy = -(logp_list.exp() * logp_list).nansum(dim=-1).mean()
+                    policy_loss = (-logp * norm_adv.detach()).mean()
 
-                value_pred = value_network(global_feat_batch)
-                value_loss = torch.nn.functional.mse_loss(value_pred, return_batch)
-                ent_coef = entropy_coef_by_step(update_step)
-                total_loss = policy_loss + VALUE_COEF * value_loss - ent_coef * entropy
+                    value_pred = value_network(global_feat_batch)
+                    value_loss = torch.nn.functional.mse_loss(value_pred, return_batch)
+                    ent_coef = entropy_coef_by_step(update_step)
+                    total_loss = policy_loss + VALUE_COEF * value_loss - ent_coef * entropy
 
-                global_optimizer.zero_grad()
-                value_optimizer.zero_grad()
-                total_loss.backward()
-                grad_norm_actor = torch.nn.utils.clip_grad_norm_(global_network.parameters(), max_norm=MAX_GRAD_NORM, norm_type=2)
-                grad_norm_value = torch.nn.utils.clip_grad_norm_(value_network.parameters(), max_norm=MAX_GRAD_NORM, norm_type=2)
-                global_optimizer.step()
-                value_optimizer.step()
+                    global_optimizer.zero_grad()
+                    value_optimizer.zero_grad()
+                    total_loss.backward()
+                    grad_norm_actor = torch.nn.utils.clip_grad_norm_(global_network.parameters(), max_norm=MAX_GRAD_NORM, norm_type=2)
+                    grad_norm_value_t = torch.nn.utils.clip_grad_norm_(value_network.parameters(), max_norm=MAX_GRAD_NORM, norm_type=2)
+                    global_optimizer.step()
+                    value_optimizer.step()
+                    update_step += 1
+
+                    ev = explained_variance(value_pred.detach(), return_batch.detach())
+                    policy_loss_value = float(policy_loss.item())
+                    value_loss_value = float(value_loss.item())
+                    entropy_value = float(entropy.item())
+                    grad_norm_value = float(max(grad_norm_actor.item(), grad_norm_value_t.item()))
+
                 lr_decay.step()
-                update_step += 1
-
-                ev = explained_variance(value_pred.detach(), return_batch.detach())
                 perf_data = {n: float(np.nanmean(perf_metrics[n])) for n in metric_name}
                 training_rows.append({
                     'reward': float(reward_batch.mean().item()),
-                    'value_loss': float(value_loss.item()),
-                    'policy_loss': float(policy_loss.item()),
-                    'entropy': float(entropy.item()),
-                    'grad_norm': float(max(grad_norm_actor.item(), grad_norm_value.item())),
+                    'value_loss': value_loss_value,
+                    'policy_loss': policy_loss_value,
+                    'entropy': entropy_value,
+                    'grad_norm': grad_norm_value,
                     'adv_std': float(adv_std.item()),
                     'explained_var': float(ev),
                     **perf_data,

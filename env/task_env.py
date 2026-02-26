@@ -7,13 +7,13 @@ from scheduler.online_dispatcher import DispatchContext, OnlineDispatcher
 
 
 class TaskEnv:
-    def __init__(self, agents_range=(10, 10), tasks_range=(10, 10), traits_dim=1, max_coalition_size=3, max_duration=5,
+    def __init__(self, agents_range=(10, 10), taskƒs_range=(10, 10), traits_dim=1, max_coalition_size=3, max_duration=5,
                  seed=None, plot_figure=False, task_alpha=1.0, coalition_beta=0.8, mode_cost_type='linear',
                  reward_w_makespan=1.0, reward_w_travel=0.05, reward_w_wait=0.1, reward_w_mode=0.05,
                  enable_commit_lock=True, min_commit_time=2.0, enable_quorum_protect=True,
                  switch_penalty=0.15, quorum_break_penalty=0.5, pause_event_penalty=0.2,
                  use_dense_event_reward=True, use_potential_shaping=True, potential_shaping_coef=1.0,
-                 online_dispatcher=None):
+                 online_dispatcher=None, simplified_setting='growth_only_strict'):
         """
         :param traits_dim: number of capabilities in this problem, e.g. 3 traits
         :param seed: seed to generate pseudo random problem instance
@@ -42,6 +42,7 @@ class TaskEnv:
         self.use_dense_event_reward = bool(use_dense_event_reward)
         self.use_potential_shaping = bool(use_potential_shaping)
         self.potential_shaping_coef = float(potential_shaping_coef)
+        self.simplified_setting = self._normalize_simplified_setting(simplified_setting)
         self.online_dispatcher = online_dispatcher
         if seed is not None:
             self.rng = np.random.default_rng(seed)
@@ -65,9 +66,23 @@ class TaskEnv:
         self.total_quorum_break_events = 0
         self.total_pause_events = 0
         self.total_actions = 0
+        self.total_mask_queries = 0
+        self.mask_reason_commit_lock = 0
+        self.mask_reason_quorum_protect = 0
+        self.mask_reason_execution_strict_lock = 0
         self._reward_snapshot = None
         self._event_snapshot = None
         self.reset_dense_reward_snapshot()
+
+    @staticmethod
+    def _normalize_simplified_setting(value):
+        setting = str(value).strip().lower()
+        valid_settings = {'growth_only_strict', 'growth_only_relaxed'}
+        if setting not in valid_settings:
+            raise ValueError(
+                f"invalid simplified_setting={value!r}, expected one of {sorted(valid_settings)}"
+            )
+        return setting
 
     def set_online_dispatcher(self, dispatcher):
         if dispatcher is None:
@@ -196,6 +211,10 @@ class TaskEnv:
         self.total_quorum_break_events = 0
         self.total_pause_events = 0
         self.total_actions = 0
+        self.total_mask_queries = 0
+        self.mask_reason_commit_lock = 0
+        self.mask_reason_quorum_protect = 0
+        self.mask_reason_execution_strict_lock = 0
         for task in self.task_dic.values():
             if 'workload' not in task:
                 task['workload'] = float(task['time'])
@@ -267,6 +286,10 @@ class TaskEnv:
         self.total_quorum_break_events = 0
         self.total_pause_events = 0
         self.total_actions = 0
+        self.total_mask_queries = 0
+        self.mask_reason_commit_lock = 0
+        self.mask_reason_quorum_protect = 0
+        self.mask_reason_execution_strict_lock = 0
         self.reset_dense_reward_snapshot()
 
     @staticmethod
@@ -406,6 +429,7 @@ class TaskEnv:
         return bool(self.current_time >= waiting_deadline - self.eps)
 
     def get_action_mask(self, agent_id):
+        self.total_mask_queries += 1
         mask = self.get_unfinished_task_mask()
         if np.sum(mask) == self.tasks_num:
             mask = np.insert(mask, 0, False)
@@ -415,6 +439,17 @@ class TaskEnv:
 
         agent = self.agent_dic[agent_id]
         current_target = int(agent.get('target_task_id', -1))
+        if (
+            self.simplified_setting == 'growth_only_strict'
+            and current_target in self.task_dic
+            and not self.task_dic[current_target]['finished']
+            and agent_id in self.task_dic[current_target].get('active_members', [])
+        ):
+            constrained = np.ones_like(mask, dtype=bool)
+            constrained[current_target + 1] = mask[current_target + 1]
+            self.mask_reason_execution_strict_lock += 1
+            return constrained
+
         locked_task = int(agent.get('commit_task_id', -1))
         lock_active = (
             self.enable_commit_lock
@@ -425,11 +460,13 @@ class TaskEnv:
         if lock_active:
             constrained = np.ones_like(mask, dtype=bool)
             constrained[locked_task + 1] = mask[locked_task + 1]
+            self.mask_reason_commit_lock += 1
             return constrained
 
         if current_target in self.task_dic and not self._can_leave_task(agent_id, current_target):
             constrained = np.ones_like(mask, dtype=bool)
             constrained[current_target + 1] = mask[current_target + 1]
+            self.mask_reason_quorum_protect += 1
             return constrained
 
         return mask
@@ -491,10 +528,17 @@ class TaskEnv:
 
     def get_behavior_metrics(self):
         action_denom = float(max(self.total_actions, 1))
+        mask_denom = float(max(self.total_mask_queries, 1))
         return {
             'switch_rate': float(self.total_switch_events / action_denom),
             'quorum_break_rate': float(self.total_quorum_break_events / action_denom),
             'pause_events': float(self.total_pause_events),
+            'mask_reason_commit_lock': float(self.mask_reason_commit_lock),
+            'mask_reason_quorum_protect': float(self.mask_reason_quorum_protect),
+            'mask_reason_execution_strict_lock': float(self.mask_reason_execution_strict_lock),
+            'mask_reason_commit_lock_rate': float(self.mask_reason_commit_lock / mask_denom),
+            'mask_reason_quorum_protect_rate': float(self.mask_reason_quorum_protect / mask_denom),
+            'mask_reason_execution_strict_lock_rate': float(self.mask_reason_execution_strict_lock / mask_denom),
         }
 
     def get_current_agent_status(self, agent):

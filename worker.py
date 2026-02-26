@@ -54,6 +54,7 @@ class Worker:
             use_dense_event_reward=USE_DENSE_EVENT_REWARD,
             use_potential_shaping=USE_POTENTIAL_SHAPING,
             potential_shaping_coef=POTENTIAL_SHAPING_COEF,
+            simplified_setting=SIMPLIFIED_SETTING,
             online_dispatcher=online_dispatcher,
         )
         self.baseline_env = copy.deepcopy(self.env)

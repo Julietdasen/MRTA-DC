@@ -147,7 +147,11 @@ class TSPSolver:
             time_ = env.get_matrix(tasks, 'time')
             coords = np.hstack([coords, np.array(time_).reshape(len(time_), -1)])
             coords = np.vstack([env.depot['location'].tolist() + [0], coords])
-            routes, route_distance = self.run_solver(coords, agent_groups[cat])
+            result = self.run_solver(coords, agent_groups[cat])
+            if result is None:
+                print(f'[OR-Tools] Warning: no solution found for cat={cat}, skipping.')
+                continue
+            routes, route_distance = result
             for i in range(agent_groups[cat]):
                 routes[i] = routes2id(routes[i], tasks)
                 if routes[i] == [0]:
@@ -168,7 +172,7 @@ if __name__ == '__main__':
     from natsort import natsorted
     solver = TSPSolver()
     time = []
-    folder = 'testSet_20A_50T_CONDET'
+    folder = 'testSet_v0_1_20A_50T_CONDET' # 这里是制定Test Set的文件夹，文件夹内应该有env_*.pkl的环境文件
     method = 'OR-Tools'
     files = natsorted(glob.glob(f'./{folder}/env_*.pkl'), key=lambda y: y.lower())
     perf_metrics = {
@@ -182,7 +186,7 @@ if __name__ == '__main__':
         'utilization_travel': [],
         'efficiency': [],
     }
-    for i in files:
+    for i in files[0:1]: # 这里可以小batch test一下
         env = pickle.load(open(i, 'rb'))
         agents = env.agent_dic
         tasks = env.task_dic

@@ -7,19 +7,19 @@ from itertools import permutations
 import pickle
 import os
 
-test_set = 'testSet_20A_50T_CONDET'
+test_set = 'testSet_v0_1_20A_50T_CONDET'
 test_instances_num = 50
 agents_range = (20, 20)
 tasks_range = (50, 50)
-if not os.path.exists(f'./{test_set}'):
-    os.makedirs(f'./{test_set}')
-    for i in range(test_instances_num):
+os.makedirs(f'./{test_set}', exist_ok=True)
+for i in range(test_instances_num):
+    pkl_path = f'./{test_set}/env_{i}.pkl'
+    if not os.path.exists(pkl_path):
         env = TaskEnv(agents_range, tasks_range, traits_dim=1, max_coalition_size=5, seed=i)
-        pickle.dump(env, open(f'../{test_set}/env_{i}.pkl', 'wb'))
-agent_yaml = dict()
-task_yaml = dict()
+        with open(pkl_path, 'wb') as f:
+            pickle.dump(env, f)
+
 planner_param = dict()
-graph_yaml = dict()
 folder = test_set
 planner = 'TEAMPLANNER_CONDET'
 solver_time = 300.0
@@ -38,12 +38,22 @@ def compute_euclidean_distance_matrix(locations):
 
 
 for i in range(test_instances_num):
-    env = pickle.load(open(f'{folder}/env_{i}.pkl', 'rb'))
-    if os.path.exists(f'{folder}/env_{i}.pkl'):
-        if not os.path.exists(f'{folder}/env_{i}'):
-            os.mkdir(f'{folder}/env_{i}')
-        if os.path.exists(f'{folder}/env_{i}/*.yaml'):
-            continue
+    with open(f'{folder}/env_{i}.pkl', 'rb') as f:
+        env = pickle.load(f)
+    env_dir = f'{folder}/env_{i}'
+    os.makedirs(env_dir, exist_ok=True)
+    required_yaml = [
+        f'{env_dir}/vehicle_param.yaml',
+        f'{env_dir}/task_param.yaml',
+        f'{env_dir}/planner_param.yaml',
+        f'{env_dir}/graph.yaml',
+    ]
+    if all(os.path.exists(path) for path in required_yaml):
+        continue
+
+    agent_yaml = dict()
+    task_yaml = dict()
+    graph_yaml = dict()
     env.force_waiting = True
     coords = env.get_matrix(env.task_dic, 'location')
     dist_matrix = compute_euclidean_distance_matrix(coords)

@@ -500,7 +500,7 @@ v1.0 的变化:
    - `workload`, `remaining_workload`, `alpha`, `quorum`
    - `core_members`, `support_members`, `active_members`
 2. 新增配置开关:
-   - `EXECUTION_SEMANTICS = growth_only_strict | growth_only_relaxed`
+   - `SIMPLIFIED_SETTING = growth_only_strict | growth_only_relaxed`
 3. 在 `get_action_mask(agent_id)` 中实现:
    - 执行期离开限制
    - quorum protect

@@ -63,6 +63,9 @@ REWARD_W_MODE = 0.05
 # =============================================================================
 # Anti-Oscillation Constraints + Event Reward (v0.3)
 # =============================================================================
+# SIMPLIFIED_SETTING: v1.0 simplified execution switch.
+# Supported values: 'growth_only_strict', 'growth_only_relaxed'
+SIMPLIFIED_SETTING = os.getenv('DCMRTA_SIMPLIFIED_SETTING', 'growth_only_strict').strip().lower()
 # Commit lock: once assigned, agent remains committed for MIN_COMMIT_TIME.
 ENABLE_COMMIT_LOCK = True
 MIN_COMMIT_TIME = 2.0

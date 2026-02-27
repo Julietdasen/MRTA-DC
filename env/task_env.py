@@ -3,11 +3,12 @@ import matplotlib.pyplot as plt
 from matplotlib import patches
 from matplotlib.animation import FuncAnimation
 from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+import time
 from scheduler.online_dispatcher import DispatchContext, OnlineDispatcher
 
 
 class TaskEnv:
-    def __init__(self, agents_range=(10, 10), taskƒs_range=(10, 10), traits_dim=1, max_coalition_size=3, max_duration=5,
+    def __init__(self, agents_range=(10, 10), tasks_range=(10, 10), traits_dim=1, max_coalition_size=3, max_duration=5,
                  seed=None, plot_figure=False, task_alpha=1.0, coalition_beta=0.8, mode_cost_type='linear',
                  reward_w_makespan=1.0, reward_w_travel=0.05, reward_w_wait=0.1, reward_w_mode=0.05,
                  enable_commit_lock=True, min_commit_time=2.0, enable_quorum_protect=True,
@@ -185,6 +186,7 @@ class TaskEnv:
                             'time_exec': 0.0,
                             'time_wait': 0.0,
                             'time_travel': 0.0,
+                            'route_exhausted': False,
                             'commit_task_id': -1,
                             'commit_until': 0.0,
                             'last_task_id': -1,
@@ -261,6 +263,8 @@ class TaskEnv:
                 agent['last_task_id'] = -1
             if 'switch_count' not in agent:
                 agent['switch_count'] = 0
+            if 'route_exhausted' not in agent:
+                agent['route_exhausted'] = False
         self.reset_dense_reward_snapshot()
 
     def clear_decisions(self):
@@ -277,7 +281,7 @@ class TaskEnv:
                          sum_waiting_time=0, working_condition=0, current_action_index=0,
                          trajectory=[], angle=0, returned=False, pre_set_route=None, depot=self.depot['location'],
                          state='IDLE_AT_DEPOT', target_task_id=-1, time_exec=0.0, time_wait=0.0, time_travel=0.0,
-                         commit_task_id=-1, commit_until=0.0, last_task_id=-1, switch_count=0)
+                         route_exhausted=False, commit_task_id=-1, commit_until=0.0, last_task_id=-1, switch_count=0)
         self.depot.update(members=[], ID=-1)
         self.current_time = 0
         self.last_update_time = 0
@@ -649,6 +653,14 @@ class TaskEnv:
     def agent_update(self):
         for agent in self.agent_dic.values():
             if len(agent['arrival_time']) == 0:
+                if agent.get('route_exhausted', False):
+                    agent['state'] = 'IDLE_AT_DEPOT'
+                    agent['target_task_id'] = -1
+                    agent['assigned'] = False
+                    agent['returned'] = True
+                    agent['next_decision'] = np.nan
+                    agent['working_condition'] = 0.0
+                    continue
                 agent['state'] = 'IDLE_AT_DEPOT'
                 agent['target_task_id'] = -1
                 if not np.all(self.get_matrix(self.task_dic, 'finished')):
@@ -671,6 +683,13 @@ class TaskEnv:
                 continue
 
             if target_task_id == -1:
+                if agent.get('route_exhausted', False):
+                    agent['state'] = 'IDLE_AT_DEPOT'
+                    agent['assigned'] = False
+                    agent['returned'] = True
+                    agent['next_decision'] = np.nan
+                    agent['working_condition'] = 0.0
+                    continue
                 agent['state'] = 'IDLE_AT_DEPOT'
                 agent['assigned'] = False
                 if np.all(self.get_matrix(self.task_dic, 'finished')):
@@ -851,6 +870,7 @@ class TaskEnv:
         if task_id != -1:
             task = self.task_dic[task_id]
             agent['returned'] = False
+            agent['route_exhausted'] = False
             agent['commit_task_id'] = task_id
             if self.enable_commit_lock:
                 agent['commit_until'] = float(self.current_time + self.min_commit_time)
@@ -858,6 +878,7 @@ class TaskEnv:
                 agent['commit_until'] = float(self.current_time)
         else:
             task = self.depot
+            agent['route_exhausted'] = False
             agent['commit_task_id'] = -1
             agent['commit_until'] = float(self.current_time)
         agent['last_task_id'] = previous_target
@@ -1164,11 +1185,42 @@ class TaskEnv:
                 grouped_agents[keys] = int(agent_v_r[i])
         return grouped_tasks, grouped_agents
 
-    def execute_by_route(self, path='./', method=0, plot_figure=False, max_time=200, max_waiting_time=100):
+    def execute_by_route(
+        self,
+        path='./',
+        method=0,
+        plot_figure=False,
+        max_time=200,
+        max_waiting_time=100,
+        max_wall_time_sec=None,
+        progress_log_interval_sec=0.0,
+    ):
         self.plot_figure = plot_figure
         if max_waiting_time is not None:
             self.max_waiting_time = float(max_waiting_time)
+        wall_start = time.perf_counter()
+        last_log = wall_start
+        loop_count = 0
         while not self.finished and self.current_time < float(max_time):
+            loop_count += 1
+            now = time.perf_counter()
+            if max_wall_time_sec is not None and max_wall_time_sec > 0 and (now - wall_start) >= float(max_wall_time_sec):
+                print(
+                    '[execute_by_route] wall-time timeout reached: '
+                    f'{now - wall_start:.2f}s >= {float(max_wall_time_sec):.2f}s; stop simulation.'
+                )
+                break
+            if progress_log_interval_sec is not None and progress_log_interval_sec > 0 and (now - last_log) >= float(progress_log_interval_sec):
+                unfinished = int(np.sum(np.logical_not(self.get_matrix(self.task_dic, 'finished'))))
+                print(
+                    '[execute_by_route] progress '
+                    f'wall_s={now - wall_start:.2f} '
+                    f'loops={loop_count} '
+                    f'sim_t={float(self.current_time):.4f} '
+                    f'unfinished={unfinished}'
+                )
+                last_log = now
+            loop_time = float(self.current_time)
             if self.reactive_planning:
                 self.visible_length = int(np.clip(self.current_time//10 * 20 + 20, 20, 100))
             decision_agents, current_time = self.next_decision()
@@ -1177,6 +1229,17 @@ class TaskEnv:
             self.agent_update()
             for agent in decision_agents:
                 if self.agent_dic[agent]['pre_set_route'] is None or not self.agent_dic[agent]['pre_set_route']:
+                    # If an agent has no prescribed route and is already at depot, park it to
+                    # avoid issuing zero-travel depot actions forever at the same timestamp.
+                    agent_state = self.agent_dic[agent]
+                    at_depot = np.linalg.norm(agent_state['location'] - self.depot['location']) <= self.eps
+                    if at_depot:
+                        agent_state['state'] = 'IDLE_AT_DEPOT'
+                        agent_state['target_task_id'] = -1
+                        agent_state['next_decision'] = np.nan
+                        agent_state['returned'] = True
+                        agent_state['route_exhausted'] = True
+                        continue
                     self.agent_step(agent, 0)
                     self.task_update()
                     self.agent_update()
@@ -1192,6 +1255,18 @@ class TaskEnv:
                 self.task_update()
                 self.agent_update()
             self.finished = self.check_finished()
+
+            # Deadlock guard: no progress in time and no future executable events.
+            if not self.finished and abs(float(self.current_time) - loop_time) <= self.eps:
+                has_active_task = any(
+                    (not task['finished']) and len(task.get('active_members', [])) > 0
+                    for task in self.task_dic.values()
+                )
+                decision_time = np.array(self.get_matrix(self.agent_dic, 'next_decision'), dtype=float)
+                has_future_decision = bool(np.any(np.isfinite(decision_time) & (decision_time > self.current_time + self.eps)))
+                if (not has_active_task) and (not has_future_decision):
+                    print('[execute_by_route] deadlock guard triggered: no active task and no future decision; stop simulation.')
+                    break
         if self.plot_figure:
             self.plot_animation(path, method)
         print(self.current_time)
@@ -1203,6 +1278,7 @@ class TaskEnv:
             self.agent_dic[agent_id]['pre_set_route'] = routes
         else:
             self.agent_dic[agent_id]['pre_set_route'] += routes
+        self.agent_dic[agent_id]['route_exhausted'] = False
 
     def process_map(self, path):
         import pandas as pd

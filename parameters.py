@@ -58,7 +58,7 @@ MODE_COST_TYPE = 'linear'  # options: 'linear' or 'quadratic'
 REWARD_W_MAKESPAN = 1.0
 REWARD_W_TRAVEL = 0.05
 REWARD_W_WAIT = 0.1
-REWARD_W_MODE = 0.05
+REWARD_W_MODE = 0.1
 
 # =============================================================================
 # Anti-Oscillation Constraints + Event Reward (v0.3)
@@ -128,7 +128,7 @@ gifs_path = os.getenv('DCMRTA_GIFS_PATH', f'gifs/{FOLDER_NAME}')
 LOAD_MODEL = False
 # SAVE_IMG/SAVE_IMG_GAP: GIF generation controls.
 SAVE_IMG = True
-SAVE_IMG_GAP = 10000
+SAVE_IMG_GAP = 10240
 # WANDB_LOG: external experiment tracking toggle.
 WANDB_LOG = False
 

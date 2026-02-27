@@ -7,11 +7,11 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # -----------------------------
 # User editable settings
 # -----------------------------
-ALGO_NAME="${ALGO_NAME:-REINFORCE}"
+ALGO_NAME="${ALGO_NAME:-REINFORCE}" # 这里可以设置默认的算法名称，如果不指定TRAIN_ALGO，则使用ALGO_NAME作为训练算法
 TRAIN_ALGO="${TRAIN_ALGO:-${ALGO_NAME}}"
 RUN_ROOT="${RUN_ROOT:-${PROJECT_ROOT}/runs}"
 RUN_TAG="${RUN_TAG:-baseline}"
-RUN_COMMENT="${RUN_COMMENT:-manual_run_with_v0_3}" # 这里可以添加一些备注信息，比如实验的目的、使用的数据集等，方便后续回顾和分析
+RUN_COMMENT="${RUN_COMMENT:-manual_run_with_v1_0}" # 这里可以添加一些备注信息，比如实验的目的、使用的数据集等，方便后续回顾和分析
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DRIVER_PATH="${DRIVER_PATH:-${PROJECT_ROOT}/driver.py}"
 

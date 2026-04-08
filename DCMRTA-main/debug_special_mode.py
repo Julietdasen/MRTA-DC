@@ -1,7 +1,7 @@
 import copy
-from env.task_env import TaskEnv
+from env.task_env_special import TaskEnvSpecial
 
-env = TaskEnv(
+env = TaskEnvSpecial(
     agents_range=(10, 10),
     tasks_range=(20, 20),
     traits_dim=1,

@@ -7,12 +7,7 @@ from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 
 class TaskEnv:
     def __init__(self, agents_range=(10, 10), tasks_range=(10, 10), traits_dim=1, max_coalition_size=3, max_duration=5,
-                 seed=None, plot_figure=False, 
-                 enable_special_modes=True,          # 是否启用“一个任务有两个随机mode”
-                num_special_tasks=1,                # 先只做1个特殊任务
-                mode_size_low=2,                    # 随机mode最小coalition size
-                special_time_range=(80, 140),       # 特殊任务基础时间范围
-                special_speedup_range=(10, 30)):
+                 seed=None, plot_figure=False):
         """
         :param traits_dim: number of capabilities in this problem, e.g. 3 traits
         :param seed: seed to generate pseudo random problem instance
@@ -23,14 +18,6 @@ class TaskEnv:
         self.max_coalition_size = max_coalition_size
         self.max_duration = max_duration
         self.plot_figure = plot_figure
-
-        # 这里是修改是否有动态联盟规模，也就是任务是否会有不同的mode
-        self.enable_special_modes = enable_special_modes
-        self.num_special_tasks = num_special_tasks
-        self.mode_size_low = mode_size_low
-        self.special_time_range = special_time_range
-        self.special_speedup_range = special_speedup_range
-
         if seed is not None:
             self.rng = np.random.default_rng(seed)
         self.traits_dim = traits_dim
@@ -66,97 +53,12 @@ class TaskEnv:
         else:
             choice = np.random.choice(a, size, replace)
         return choice
-    
-
-    # 这里是添加的辅助函数，用于生成具有特殊模式的任务
-
-    def random_float(self, low, high):
-            if self.rng is not None:
-                return float(self.rng.uniform(low, high))
-            return float(np.random.uniform(low, high))
-
-    def sample_two_mode_sizes(self):
-    # 从 [mode_size_low, max_coalition_size] 中采样两个不同整数
-        candidates = np.arange(self.mode_size_low, self.max_coalition_size + 1)
-        mode_sizes = sorted(self.random_choice(candidates, size=2, replace=False).tolist())
-        return int(mode_sizes[0]), int(mode_sizes[1])
-
-    def sample_special_mode_times(self, small_k, large_k):
-        # 小mode时间更长，大mode时间更短
-        t_low, t_high = self.special_time_range
-        s_low, s_high = self.special_speedup_range
-
-        base_time = float(self.random_int(t_low, t_high + 1))
-        speedup = float(self.random_int(s_low, s_high + 1))
-        small_time = base_time
-        large_time = max(10.0, base_time - speedup)
-        return float(small_time), float(large_time)
-
-    def get_special_parent_ids(self):
-        return sorted(list(set(
-            task['parent_task_id']
-            for task in self.task_dic.values()
-            if task.get('is_special_mode', False)
-        )))
-
-    def get_special_mode_tasks(self):
-        return [task for task in self.task_dic.values() if task.get('is_special_mode', False)]
-
-    def lock_mode_group(self, selected_task_id):
-        selected_task = self.task_dic[selected_task_id]
-        parent_id = selected_task['parent_task_id']
-
-        for task in self.task_dic.values():
-            if task['parent_task_id'] == parent_id and task['ID'] != selected_task_id:
-                task['disabled'] = True
-                # 为了不干扰episode终止条件，直接把同组另一个mode设成“伪完成”
-                task['feasible_assignment'] = True
-                task['finished'] = True
-                task['status'] = np.zeros_like(task['status'])
-
-    def force_special_mode(self, chosen_mode_name):
-        # chosen_mode_name: 'small_mode' 或 'large_mode'
-        parent_ids = self.get_special_parent_ids()
-        if len(parent_ids) != 1:
-            return
-        special_parent_id = parent_ids[0]
-
-        for task in self.task_dic.values():
-            if task['parent_task_id'] == special_parent_id:
-                if task.get('mode_name') != chosen_mode_name:
-                    task['disabled'] = True
-                    task['feasible_assignment'] = True
-                    task['finished'] = True
-                    task['status'] = np.zeros_like(task['status'])
-
-    def describe_special_modes(self):
-        info = []
-        for task in self.get_special_mode_tasks():
-            info.append({
-                'env_task_id': task['ID'],
-                'parent_task_id': task['parent_task_id'],
-                'mode_name': task['mode_name'],
-                'requirements': int(np.array(task['requirements']).reshape(-1)[0]),
-                'time': float(task['time']),
-                'location': task['location'].tolist(),
-            })
-        return info
-
-    def get_parent_task_success_rate(self):
-        parent_finished = {}
-        for task in self.task_dic.values():
-            pid = task.get('parent_task_id', task['ID'])
-            parent_finished[pid] = parent_finished.get(pid, False) or task['finished']
-        return sum(parent_finished.values()) / len(parent_finished)
-
-
-   
 
     def generate_env(self):
         if type(self.tasks_range) is tuple:
-            real_tasks_num = self.random_int(self.tasks_range[0], self.tasks_range[1] + 1)
+            tasks_num = self.random_int(self.tasks_range[0], self.tasks_range[1] + 1)
         else:
-            real_tasks_num = self.tasks_range
+            tasks_num = self.tasks_range
         if type(self.agents_range) is tuple:
             agents_num = self.random_int(self.agents_range[0], self.agents_range[1] + 1)
         else:
@@ -164,76 +66,27 @@ class TaskEnv:
         agents_ini = np.ones((agents_num, self.traits_dim))
         depot = self.random_value(1, 2)
         cost_ini = self.random_value(agents_num, 1)
-        tasks_loc = self.random_value(real_tasks_num, 2)
+        tasks_loc = self.random_value(tasks_num, 2)
+        tasks_time = np.ones((tasks_num, 1)) * self.max_duration
+        tasks_ini = self.random_int(1, self.max_coalition_size + 1, tasks_num).reshape(-1, self.traits_dim)
 
         task_dic = dict()
         agent_dic = dict()
-        env_task_id = 0
-
-        if self.enable_special_modes and self.num_special_tasks > 0:
-            special_parent_ids = set(
-                self.random_choice(
-                    np.arange(real_tasks_num),
-                    size=min(self.num_special_tasks,real_tasks_num),
-                    replace=False
-                ).tolist()
-                
-            )
-        else:
-            special_parent_ids = set()
-        
-        for parent_id in range(real_tasks_num):
-            loc = tasks_loc[parent_id, :]
-
-            if parent_id in special_parent_ids:
-                # 随机两个 coalition mode
-                k_small, k_large = self.sample_two_mode_sizes()
-                t_small, t_large = self.sample_special_mode_times(k_small, k_large)
-
-                mode_specs = [
-                    (k_small, t_small, 'small_mode', True),
-                    (k_large, t_large, 'large_mode', True),
-                ]
-            else:
-                # 普通任务还是原来的单mode
-                req = int(self.random_int(1, self.max_coalition_size + 1))
-                duration = float(self.max_duration)
-                mode_specs = [
-                    (req, duration, 'default_mode', False),
-                ]
-
-            current_mode_ids = []
-
-            for req, duration, mode_name, is_special in mode_specs:
-                task_dic[env_task_id] = {
-                    'ID': env_task_id,                       # env里的task id
-                    'parent_task_id': parent_id,            # 真实任务id
-                    'mode_name': mode_name,                 # 'small_mode' / 'large_mode' / 'default_mode'
-                    'requirements': np.array([req]),        # 当前mode所需人数
-                    'members': [],
-                    'cost': [],
-                    'location': loc.copy(),
-                    'feasible_assignment': False,
-                    'finished': False,
-                    'time_start': 0,
-                    'time_finish': 0,
-                    'status': np.array([req]),
-                    'time': float(duration),
-                    'base_time': float(duration),
-                    'sum_waiting_time': 0,
-                    'efficiency': 0,
-                    'abandoned_agent': [],
-                    'disabled': False,
-                    'is_special_mode': is_special,
-                }
-                current_mode_ids.append(env_task_id)
-                env_task_id += 1
-
-            # 给同一真实任务下的各个mode互相绑定
-            for tid in current_mode_ids:
-                task_dic[tid]['mode_group'] = current_mode_ids.copy()
-
-        
+        for i in range(tasks_num):
+            task_dic[i] = {'ID': i,
+                           'requirements': tasks_ini[i, :],  # requirements of the task
+                           'members': [],  # members of the task
+                           'cost': [],  # cost of each agent
+                           'location': tasks_loc[i, :],  # location of the task
+                           'feasible_assignment': False,  # whether the task assignment is feasible
+                           'finished': False,
+                           'time_start': 0,
+                           'time_finish': 0,
+                           'status': tasks_ini[i, :],
+                           'time': float(tasks_time[i, :]),
+                           'sum_waiting_time': 0,
+                           'efficiency': 0,
+                           'abandoned_agent': []}
         for i in range(agents_num):
             agent_dic[i] = {'ID': i,
                             'abilities': agents_ini[i, :],
@@ -275,21 +128,8 @@ class TaskEnv:
 
     def clear_decisions(self):
         for task in self.task_dic.values():
-            req = task['requirements']
-            task.update(
-                        members=[], 
-                        cost=[], 
-                        finished=False, 
-                        status=req.copy() if isinstance(req, np.ndarray) else np.array([req]),
-                        feasible_assignment=False,
-                        time_start=0, 
-                        time_finish=0, 
-                        sum_waiting_time=0, 
-                        efficiency=0, 
-                        abandoned_agent=[],
-                        disabled=False,
-                        time=float(task.get('base_time', task['time']))
-            )
+            task.update(members=[], cost=[], finished=False, status=task['requirements'],feasible_assignment=False,
+                        time_start=0, time_finish=0, sum_waiting_time=0, efficiency=0, abandoned_agent=[])
         for agent in self.agent_dic.values():
             agent.update(route=[], location=self.depot['location'], next_location=self.depot['location'],
                          next_decision=0, travel_time=0, travel_dist=0, arrival_time=[], assigned=False,
@@ -350,14 +190,8 @@ class TaskEnv:
         return current_tasks
 
     def get_unfinished_task_mask(self):
-        unfinished_tasks = []
-        for task in self.task_dic.values():
-            unfinished_tasks.append(
-                (not task.get('disabled', False))
-                and (task['feasible_assignment'] is False)
-                and np.any(task['status'] > 0)
-            )
-        return unfinished_tasks
+        mask = np.logical_not(self.get_unfinished_tasks())
+        return mask
 
     def get_unfinished_tasks(self):
         unfinished_tasks = []
@@ -471,13 +305,11 @@ class TaskEnv:
         """
         #  choose any task
         task_id = task_id - 1
-        agent = self.agent_dic[agent_id]
-
         if task_id != -1:
+            agent = self.agent_dic[agent_id]
             task = self.task_dic[task_id]
-            if len(task.get('mode_group', [])) > 1 and len(task['members']) == 0:
-                self.lock_mode_group(task_id)
         else:
+            agent = self.agent_dic[agent_id]
             task = self.depot
         agent['route'].append(task_id)
         travel_time = self.calculate_eulidean_distance(agent, task) / agent['velocity']

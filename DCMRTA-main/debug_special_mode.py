@@ -6,13 +6,13 @@ env = TaskEnvSpecial(
     tasks_range=(20, 20),
     traits_dim=1,
     max_coalition_size=7,
-    max_duration=100,
+    max_duration=5,
     seed=0,
     enable_special_modes=True,
     num_special_tasks=1,
     mode_size_low=2,
-    special_time_range=(80, 140),
-    special_speedup_range=(10, 30),
+    special_time_range=(4, 10),
+    special_speedup_range=(1, 3),
 )
 
 print("===== Special modes sampled =====")

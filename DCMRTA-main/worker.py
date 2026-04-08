@@ -3,6 +3,7 @@ import time
 import torch
 import numpy as np
 from env.task_env_special import TaskEnvSpecial
+# from env.task_env import TaskEnv
 from attention import AttentionNet
 import scipy.signal as signal
 from parameters import *

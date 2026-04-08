@@ -23,10 +23,13 @@ IL_DECAY = -1e-5  # -1e-6 700k decay 0.5, -1e-5 70k decay 0.5, -1e-4 7k decay 0.
 # 检验小规模下的求解
 
 # 0408-multimode-test配置如下
+# AGENTS_RANGE = (10, 10)
+# TASKS_RANGE = (20, 20)
+# COALITION_SIZE = 7
 AGENTS_RANGE = (10, 10)
 TASKS_RANGE = (20, 20)
-
 COALITION_SIZE = 7
+
 MAX_TIME = 100
 TRAIT_DIM = 1
 FOLDER_NAME = 'REINFORCE_0408_multimode_test'

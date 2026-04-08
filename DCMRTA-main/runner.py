@@ -6,6 +6,7 @@ from attention import AttentionNet
 from worker import Worker
 from parameters import *
 from env.task_env_special import TaskEnvSpecial
+# from env.task_env import TaskEnv
 
 
 class Runner(object):

@@ -18,14 +18,14 @@ class TaskEnvSpecial(TaskEnv):
         tasks_range=(20, 20),
         traits_dim=1,
         max_coalition_size=7,
-        max_duration=100,
+        max_duration=5,
         seed=None,
         plot_figure=False,
         enable_special_modes=True,
-        num_special_tasks=1,
+        num_special_tasks=1, # 这个也是可以修改的
         mode_size_low=2,
-        special_time_range=(80, 140),
-        special_speedup_range=(10, 30),
+        special_time_range=(4, 10),
+        special_speedup_range=(1, 3),
     ):
         self.enable_special_modes = enable_special_modes
         self.num_special_tasks = num_special_tasks
@@ -65,7 +65,7 @@ class TaskEnvSpecial(TaskEnv):
         mode_sizes = sorted(
             self.random_choice(candidates, size=2, replace=False).tolist()
         )
-        return int(mode_sizes[0]), int(mode_sizes[1])
+        return int(mode_sizes[0]), int(mode_sizes[1]) # 最后return两个size
 
     def sample_special_mode_times(self, small_k, large_k):
         """Sample durations for the two modes, with the larger coalition faster."""
@@ -74,14 +74,14 @@ class TaskEnvSpecial(TaskEnv):
 
         base_time = float(self.random_int(t_low, t_high + 1))
         size_gap = max(int(large_k) - int(small_k), 1)
-        min_speedup = min(max(int(s_low), size_gap), int(s_high))
+        min_speedup = min(max(int(s_low), size_gap), int(s_high)) # 最小的加速
         if min_speedup > int(s_high):
             speedup = float(size_gap)
         else:
             speedup = float(self.random_int(min_speedup, int(s_high) + 1))
 
         small_time = base_time
-        large_time = max(10.0, base_time - speedup)
+        large_time = max(2.0, base_time - speedup)
         return float(small_time), float(large_time)
 
     def _sync_mode_metadata(self):

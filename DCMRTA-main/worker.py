@@ -2,8 +2,8 @@ import pickle
 import time
 import torch
 import numpy as np
-from env.task_env_special import TaskEnvSpecial
-# from env.task_env import TaskEnv
+# from env.task_env_special import TaskEnvSpecial
+from env.task_env import TaskEnv
 from attention import AttentionNet
 import scipy.signal as signal
 from parameters import *
@@ -30,7 +30,7 @@ class Worker:
         self.metaAgentID = mete_agent_id
         self.global_step = global_step
         self.save_image = save_image
-        self.env = TaskEnvSpecial(agents_num, tasks_num, TRAIT_DIM, COALITION_SIZE, seed=seed, plot_figure=save_image)
+        self.env = TaskEnv(agents_num, tasks_num, TRAIT_DIM, COALITION_SIZE, seed=seed, plot_figure=save_image)
         self.baseline_env = copy.deepcopy(self.env)
         self.local_net = local_network
         self.local_baseline = local_baseline

@@ -265,7 +265,9 @@ class AttentionNet(nn.Module):
         embedding_dim = task_embedding.size(-1)
         # scatter reduced by mean to extract the mean of each data in the batch
         mean_mask = mask[:,0,:].unsqueeze(2).repeat(1, 1, embedding_dim)
-        compressed_task = torch.where(mean_mask, torch.nan, task_embedding)
+        # compressed_task = torch.where(mean_mask, torch.nan, task_embedding)
+        nan_tensor = torch.full_like(task_embedding, float('nan'))
+        compressed_task = torch.where(mean_mask, nan_tensor, task_embedding)
         compressed_task = torch.nanmean(compressed_task, dim=1).unsqueeze(1)
         return compressed_task, task_encoding
 

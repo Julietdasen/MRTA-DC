@@ -5,8 +5,8 @@ import os
 from attention import AttentionNet
 from worker import Worker
 from parameters import *
-from env.task_env_special import TaskEnvSpecial
-# from env.task_env import TaskEnv
+# from env.task_env_special import TaskEnvSpecial
+from env.task_env import TaskEnv
 
 
 class Runner(object):
@@ -52,7 +52,7 @@ class Runner(object):
     def comparison(self, testing_ep, sample, sample_number, env_params):
         worker = Worker(self.metaAgentID, self.localNetwork, self.localBaseline,
                         0, self.device, False)
-        env = TaskEnvSpecial(*env_params)
+        env = TaskEnv(*env_params)
         reward = worker.run_test(testing_ep, env, sample, sample_number)
         return reward, self.metaAgentID
 

@@ -520,6 +520,248 @@ class TaskEnv:
         ani = FuncAnimation(fig, update, frames=gif_len, interval=100, blit=True)
         ani.save(f'{path}/episode_{n}_{self.current_time:.1f}.gif')
 
+    def _get_agent_departure_time(self, agent_id, visit_idx):
+        """
+        Reconstruct the departure time of agent_id for the visit_idx-th route leg.
+        """
+        agent = self.agent_dic[agent_id]
+
+        if visit_idx == 0:
+            return 0.0
+
+        prev_task_id = agent['route'][visit_idx - 1]
+        prev_arrival = float(agent['arrival_time'][visit_idx - 1])
+
+        # Previous stop is depot
+        if prev_task_id == -1:
+            return prev_arrival
+
+        prev_task = self.task_dic[prev_task_id]
+
+        # If previous task became feasible and this agent truly participated,
+        # it leaves after execution finishes; otherwise after max waiting time.
+        if (
+            prev_task['feasible_assignment']
+            and agent_id in prev_task['members']
+            and float(prev_task['time_start']) - prev_arrival <= self.max_waiting_time
+        ):
+            return float(prev_task['time_finish'])
+
+        return prev_arrival + float(self.max_waiting_time)
+
+    def build_gantt_records(self):
+        """
+        Convert route / arrival / task timing info into gantt-style time segments.
+        Returns a list of dict records:
+        {
+            'agent_id': int,
+            'start': float,
+            'end': float,
+            'state': 'travel' | 'wait' | 'execute' | 'idle',
+            'label': str,
+            'task_id': int | None
+        }
+        """
+        records = []
+
+        for agent_id, agent in self.agent_dic.items():
+            route = agent['route']
+            arrivals = agent['arrival_time']
+
+            if len(route) == 0:
+                if self.current_time > 0:
+                    records.append({
+                        'agent_id': agent_id,
+                        'start': 0.0,
+                        'end': float(self.current_time),
+                        'state': 'idle',
+                        'label': 'idle@Depot',
+                        'task_id': None,
+                    })
+                continue
+
+            for i, task_id in enumerate(route):
+                depart_t = float(self._get_agent_departure_time(agent_id, i))
+                arrive_t = float(arrivals[i])
+
+                target_name = 'Depot' if task_id == -1 else f'T{task_id + 1}'
+
+                # Travel segment
+                if arrive_t > depart_t:
+                    records.append({
+                        'agent_id': agent_id,
+                        'start': depart_t,
+                        'end': arrive_t,
+                        'state': 'travel',
+                        'label': f'travel->{target_name}',
+                        'task_id': None if task_id == -1 else task_id,
+                    })
+
+                # Depot segment
+                if task_id == -1:
+                    if i == len(route) - 1 and self.current_time > arrive_t:
+                        records.append({
+                            'agent_id': agent_id,
+                            'start': arrive_t,
+                            'end': float(self.current_time),
+                            'state': 'idle',
+                            'label': 'idle@Depot',
+                            'task_id': None,
+                        })
+                    continue
+
+                task = self.task_dic[task_id]
+
+                # Executed successfully
+                if task['feasible_assignment'] and agent_id in task['members']:
+                    task_start = float(task['time_start'])
+                    task_finish = float(task['time_finish'])
+
+                    # Wait before task starts
+                    if task_start > arrive_t:
+                        records.append({
+                            'agent_id': agent_id,
+                            'start': arrive_t,
+                            'end': task_start,
+                            'state': 'wait',
+                            'label': f'wait@T{task_id + 1}',
+                            'task_id': task_id,
+                        })
+
+                    # Execution
+                    if task_finish > task_start:
+                        records.append({
+                            'agent_id': agent_id,
+                            'start': task_start,
+                            'end': task_finish,
+                            'state': 'execute',
+                            'label': f'execute@T{task_id + 1}',
+                            'task_id': task_id,
+                        })
+
+                # Did not form feasible coalition / timed out / abandoned
+                else:
+                    wait_end = min(arrive_t + float(self.max_waiting_time), float(self.current_time))
+                    if wait_end > arrive_t:
+                        records.append({
+                            'agent_id': agent_id,
+                            'start': arrive_t,
+                            'end': wait_end,
+                            'state': 'wait',
+                            'label': f'wait/abandon@T{task_id + 1}',
+                            'task_id': task_id,
+                        })
+
+        return records
+
+    def plot_gantt(
+        self,
+        save_path=None,
+        title=None,
+        show_text=True,
+        figsize=None,
+        x_pad_ratio=0.08,          # 时间轴左右留白比例
+        min_text_width=1.2,        # 只有持续时间超过这个值才显示条内文字
+        title_fontsize=16,
+        axis_fontsize=13,
+        tick_fontsize=11,
+        text_fontsize=5,
+        dpi=260
+    ):
+        """
+        Plot a Gantt chart:
+        x-axis = time
+        y-axis = agents
+        """
+        records = self.build_gantt_records()
+
+        if figsize is None:
+            # 比原来更宽一些，纵向也稍微放大
+            figsize = (22, max(5, 0.7 * self.agents_num + 2))
+
+        color_map = {
+            'travel': 'tab:blue',
+            'wait': 'tab:orange',
+            'execute': 'tab:green',
+            'idle': 'tab:gray',
+        }
+
+        fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+
+        agent_ids = sorted(self.agent_dic.keys())
+        row_h = 7
+        row_gap = 4
+        y_pos = {aid: idx * (row_h + row_gap) for idx, aid in enumerate(agent_ids)}
+
+        max_end = 0.0
+        for rec in records:
+            y = y_pos[rec['agent_id']]
+            duration = rec['end'] - rec['start']
+            if duration <= 0:
+                continue
+
+            max_end = max(max_end, rec['end'])
+
+            ax.broken_barh(
+                [(rec['start'], duration)],
+                (y, row_h),
+                facecolors=color_map.get(rec['state'], 'tab:purple'),
+                edgecolors='black',
+                linewidth=0.8,
+                alpha=0.9
+            )
+
+            # 只有条够长才在内部写字，避免重叠
+            if show_text and duration >= min_text_width:
+                ax.text(
+                    rec['start'] + duration / 2,
+                    y + row_h / 2,
+                    rec['label'],
+                    ha='center',
+                    va='center',
+                    fontsize=text_fontsize
+                )
+
+        total_time = max(float(self.current_time), max_end, 1.0)
+        x_pad = total_time * x_pad_ratio
+
+        ax.set_xlabel('Time', fontsize=axis_fontsize)
+        ax.set_ylabel('Agent / Robot', fontsize=axis_fontsize)
+
+        ax.set_yticks([y_pos[aid] + row_h / 2 for aid in agent_ids])
+        ax.set_yticklabels([f'R{aid}' for aid in agent_ids], fontsize=tick_fontsize)
+        ax.tick_params(axis='x', labelsize=tick_fontsize)
+
+        # 给时间轴更多左右空余
+        ax.set_xlim(-x_pad, total_time + x_pad)
+
+        ax.set_ylim(
+            -2,
+            (len(agent_ids) - 1) * (row_h + row_gap) + row_h + 3 if agent_ids else 10
+        )
+
+        ax.grid(True, axis='x', linestyle='--', alpha=0.35)
+
+        if title is None:
+            title = f'Agent Gantt Chart (makespan={self.current_time:.2f})'
+        ax.set_title(title, fontsize=title_fontsize, pad=14)
+
+        legend_handles = [
+            patches.Patch(color=color_map['travel'], label='Travel'),
+            patches.Patch(color=color_map['wait'], label='Wait / Abandon'),
+            patches.Patch(color=color_map['execute'], label='Execute'),
+            patches.Patch(color=color_map['idle'], label='Idle at Depot'),
+        ]
+        ax.legend(handles=legend_handles, loc='upper right', fontsize=11)
+
+        plt.tight_layout()
+
+        if save_path is not None:
+            plt.savefig(save_path, bbox_inches='tight', dpi=dpi)
+
+        return fig, ax, records
+
+
     def get_grouped_tasks(self):
         grouped_tasks = dict()
         groups = list(set(np.array(self.get_matrix(self.task_dic, 'requirements')).squeeze(1).tolist()))

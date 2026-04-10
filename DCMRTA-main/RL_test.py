@@ -17,12 +17,12 @@ USE_GPU_GLOBAL = True
 NUM_GPU = 0
 NUM_META_AGENT = 1
 GAMMA = 1
-# 这个是制定相应的文件夹
-FOLDER_NAME = 'REINFORCE_0408_multimode_test' 
+# 制定相应的文件夹
+FOLDER_NAME = 'REINFORCE_0408_no_multimode_test' 
 
 
-METHOD = 'LF' # or 'IA'
-testSet = 'testSet_20A_50T_CONDET' # TestSet的名称
+METHOD = 'IA' # or 'IA'
+testSet = 'testSet_10A_20T_CONDET_TEST' # TestSet的名称
 model_path = f'model/{FOLDER_NAME}'
 device = torch.device('cuda:0') if USE_GPU_GLOBAL else torch.device('cpu')
 local_device = torch.device('cuda:0') if USE_GPU else torch.device('cpu')
@@ -48,7 +48,7 @@ for i in range(0, 50):
         results = worker.run_test_IS(0, env)  # for Individual Action
     else:
         results = worker.run_test(0, env)  # for Leader-Follower
-    if i < 1:
+    if i < 5:
         worker.baseline_env.plot_gantt(
             save_path=f'{testSet}/gantt_{FOLDER_NAME}_{METHOD}_{i}.png',
             title=f'{METHOD} Episode {i} | makespan={worker.baseline_env.current_time:.2f}',

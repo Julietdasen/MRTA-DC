@@ -7,15 +7,19 @@ from itertools import permutations
 import pickle
 import os
 
-test_set = 'testSet_20A_50T_CONDET'
-test_instances_num = 50
-agents_range = (20, 20)
-tasks_range = (50, 50)
-if not os.path.exists(f'./{test_set}'):
-    os.makedirs(f'./{test_set}')
-    for i in range(test_instances_num):
+test_set = 'testSet_10A_20T_CONDET_TEST'
+test_instances_num = 5
+agents_range = (10, 10)
+tasks_range = (20, 20)
+if not os.path.exists(test_set):
+    os.makedirs(test_set)
+
+for i in range(test_instances_num):
+    pkl_path = f'{test_set}/env_{i}.pkl'
+    if not os.path.exists(pkl_path):
         env = TaskEnv(agents_range, tasks_range, traits_dim=1, max_coalition_size=5, seed=i)
-        pickle.dump(env, open(f'../{test_set}/env_{i}.pkl', 'wb'))
+        pickle.dump(env, open(pkl_path, 'wb'))
+
 agent_yaml = dict()
 task_yaml = dict()
 planner_param = dict()

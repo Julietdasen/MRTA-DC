@@ -10,6 +10,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import matplotlib.pyplot as plt
 from matplotlib import patches
+import numpy as np
 
 from env.task_env import TaskEnv
 
@@ -325,6 +326,80 @@ def save_comparison_gantt(method_envs, output_dir, env_id, show_text):
     return save_path
 
 
+def save_static_route_map(method_name, env, output_dir, env_id):
+    fig, ax = plt.subplots(figsize=(8.5, 8.0), dpi=260)
+    ax.set_xlim(-0.5, 10.5)
+    ax.set_ylim(-0.5, 10.5)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_aspect("equal")
+
+    # Draw tasks using the same geometric style as TaskEnv.plot_animation.
+    for task_id, task in sorted(env.task_dic.items()):
+        loc = task["location"] * 10
+        num_vertices = int(np.asarray(task["requirements"]).sum()) + 3
+        task_color = "g" if task.get("finished", False) else "b"
+        ax.add_patch(
+            patches.RegularPolygon(
+                xy=(loc[0], loc[1]),
+                numVertices=num_vertices,
+                radius=0.30,
+                color=task_color,
+                zorder=1,
+            )
+        )
+        ax.text(loc[0] + 0.10, loc[1] + 0.10, f"T{task_id + 1}", fontsize=6, color="black", zorder=5)
+
+    depot_xy = env.depot["location"] * 10
+    ax.add_patch(patches.Circle((depot_xy[0], depot_xy[1]), 0.22, color="r", zorder=4))
+    ax.text(depot_xy[0] + 0.10, depot_xy[1] + 0.10, "D", fontsize=7, color="black", zorder=5)
+
+    agent_items = sorted(env.agent_dic.items(), key=lambda x: x[0])
+    cmap = plt.cm.get_cmap("tab20", max(len(agent_items), 1))
+
+    for idx, (agent_id, agent) in enumerate(agent_items):
+        route = agent.get("route", [])
+        points = [depot_xy]
+        for task_id in route:
+            if task_id == -1:
+                points.append(depot_xy)
+            elif task_id in env.task_dic:
+                points.append(env.task_dic[task_id]["location"] * 10)
+
+        xs = [float(p[0]) for p in points]
+        ys = [float(p[1]) for p in points]
+        color = cmap(idx)
+
+        if len(points) > 1:
+            ax.plot(xs, ys, color=color, linewidth=1.5, alpha=0.95, zorder=2, label=f"R{agent_id}")
+            ax.scatter(xs, ys, color=color, s=12, zorder=3)
+        else:
+            ax.scatter(xs[0], ys[0], color=color, s=18, marker="^", zorder=3, label=f"R{agent_id}")
+
+    max_legend_agents = 12
+    if len(agent_items) <= max_legend_agents:
+        ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8, frameon=True)
+    else:
+        ax.text(
+            1.02,
+            0.5,
+            f"{len(agent_items)} robots\n(legend hidden)",
+            transform=ax.transAxes,
+            va="center",
+            ha="left",
+            fontsize=8,
+        )
+
+    ax.set_title(f"Static Route Map | {method_name} | env_{env_id} | makespan={env.current_time:.2f}", fontsize=11)
+    plt.tight_layout()
+
+    safe_method = method_name.replace(" ", "_").replace("/", "-")
+    save_path = os.path.join(output_dir, f"static_{safe_method}_env_{env_id}.png")
+    fig.savefig(save_path, dpi=260, bbox_inches="tight")
+    plt.close(fig)
+    return save_path
+
+
 def main():
     parser = argparse.ArgumentParser(description="Plot RL / OR-Tools / CTAS-D gantt charts on one env case.")
     parser.add_argument("--test-set", default="testSet_20A_50T_CONDET")
@@ -334,6 +409,7 @@ def main():
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--show-text", action="store_true")
     parser.add_argument("--skip-rl", action="store_true")
+    parser.add_argument("--skip-static", action="store_true")
     args = parser.parse_args()
 
     output_dir = args.output_dir or args.test_set
@@ -384,6 +460,9 @@ def main():
             continue
         path = save_single_gantt(name, env, output_dir, args.env_id, args.show_text)
         print(f"[OK] Saved: {path}")
+        if not args.skip_static:
+            static_path = save_static_route_map(name, env, output_dir, args.env_id)
+            print(f"[OK] Saved: {static_path}")
 
     compare_path = save_comparison_gantt(method_envs, output_dir, args.env_id, args.show_text)
     if compare_path is not None:

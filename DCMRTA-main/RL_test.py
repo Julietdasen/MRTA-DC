@@ -64,4 +64,3 @@ for i in range(0, 50):
     df_ = pd.DataFrame(results, index=[i])
     df = pd.concat([df, df_])
 df.to_csv(f'{testSet}/REINFORCE_{METHOD}.csv')
-

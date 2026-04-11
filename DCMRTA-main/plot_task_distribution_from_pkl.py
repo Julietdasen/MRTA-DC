@@ -35,23 +35,26 @@ def plot_task_distribution(env, save_path, show_agents=True):
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_aspect("equal")
-    plt.subplots_adjust(left=0, right=0.85, top=0.87, bottom=0.02)
+    plt.subplots_adjust(left=0.02, right=0.98, top=0.87, bottom=0.02)
 
-    finished_tasks = sum(1 for t in env.task_dic.values() if t.get("finished", False))
-    total_tasks = max(len(env.task_dic), 1)
-    finished_rate = finished_tasks / total_tasks
-    ax.set_title(f"Task Distribution | finished rate {finished_rate * 100:.1f}%")
+    # finished_tasks = sum(1 for t in env.task_dic.values() if t.get("finished", False))
+    # total_tasks = max(len(env.task_dic), 1)
+    # finished_rate = finished_tasks / total_tasks
+    ax.set_title(f"Task Distribution") #
 
-    green_patch = patches.Patch(color="g", label="Finished task")
-    blue_patch = patches.Patch(color="b", label="Unfinished task")
-    red_patch = patches.Patch(color="r", label="Single agent")
-    yellow_patch = patches.Patch(color="y", label="Two agents")
-    cyan_patch = patches.Patch(color="c", label="Three agents")
-    magenta_patch = patches.Patch(color="m", label=">= Four agents")
-    ax.legend(
-        handles=[green_patch, blue_patch, red_patch, yellow_patch, cyan_patch, magenta_patch],
-        bbox_to_anchor=(0.99, 0.7),
-    )
+    # 删除这些图例，因为它们不太适合说明distribution，而且可能会引起误解
+    # green_patch = patches.Patch(color="g", label="Finished task")
+    # blue_patch = patches.Patch(color="b", label="Unfinished task")
+    # red_patch = patches.Patch(color="r", label="Single agent")
+    # yellow_patch = patches.Patch(color="y", label="Two agents")
+    # cyan_patch = patches.Patch(color="c", label="Three agents")
+    # magenta_patch = patches.Patch(color="m", label=">= Four agents")
+    # ax.legend(
+    #     handles=[green_patch, blue_patch, red_patch, yellow_patch, cyan_patch, magenta_patch],
+    #     bbox_to_anchor=(0.99, 0.7),
+    # )
+
+
 
     for task in env.task_dic.values():
         task_color = "g" if task.get("finished", False) else "b"
@@ -94,7 +97,7 @@ def main():
         type=str,
         default=None,
         help="Full path to pickle file, e.g. testSet_xxx/env_0.pkl",
-    )
+    ) # 这个参数是添加我需要画出什么pkl文件的路径
     parser.add_argument(
         "--test-set",
         type=str,

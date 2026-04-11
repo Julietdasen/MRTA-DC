@@ -152,12 +152,12 @@ class Worker:
         perf_metrics['travel_dist'] = np.sum(self.baseline_env.get_matrix(self.baseline_env.agent_dic, 'travel_dist'))
         perf_metrics['efficiency'] = np.mean(self.baseline_env.get_matrix(self.baseline_env.task_dic, 'sum_waiting_time'))
         if image_path is not None:
-            self.baseline_env.plot_animation(image_path, f'RL_{test_episode}')
+            self.baseline_env.plot_animation(image_path, 'RL')
         # self.generate_route()
         # self.baseline_env.process_map(image_path)
         return perf_metrics
 
-    def run_test_IS(self, test_episode, test_env, image_path=None):
+    def run_test_IS(self, test_episode, test_env):
         perf_metrics = dict()
         self.baseline_env = copy.copy(test_env)
         self.baseline_env.plot_figure = False
@@ -196,8 +196,6 @@ class Worker:
         perf_metrics['waiting_time'] = np.mean(self.baseline_env.get_matrix(self.baseline_env.agent_dic, 'sum_waiting_time'))
         perf_metrics['travel_dist'] = np.sum(self.baseline_env.get_matrix(self.baseline_env.agent_dic, 'travel_dist'))
         perf_metrics['efficiency'] = np.mean(self.baseline_env.get_matrix(self.baseline_env.task_dic, 'sum_waiting_time'))
-        if image_path is not None:
-            self.baseline_env.plot_animation(image_path, f'RL_IA_{test_episode}')
         return perf_metrics
 
     def baseline_test(self):

@@ -1,4 +1,5 @@
 import numpy as np
+import os
 import matplotlib.pyplot as plt
 from matplotlib import patches
 from matplotlib.animation import FuncAnimation
@@ -518,6 +519,7 @@ class TaskEnv:
 
         # Set up the animation
         ani = FuncAnimation(fig, update, frames=gif_len, interval=100, blit=True)
+        os.makedirs(path, exist_ok=True)
         ani.save(f'{path}/episode_{n}_{self.current_time:.1f}.gif')
 
     def _get_agent_departure_time(self, agent_id, visit_idx):
@@ -673,6 +675,7 @@ class TaskEnv:
         x-axis = time
         y-axis = agents
         """
+        # 这个函数是绘制gantt图
         records = self.build_gantt_records()
 
         if figsize is None:

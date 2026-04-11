@@ -18,7 +18,7 @@ NUM_GPU = 0
 NUM_META_AGENT = 1
 GAMMA = 1
 # 制定相应的文件夹
-FOLDER_NAME = 'REINFORCE_0408_no_multimode_test' 
+FOLDER_NAME = 'REINFORCE_0408_multimode_test' 
 
 
 METHOD = 'IA' # or 'IA'
@@ -49,10 +49,16 @@ for i in range(0, 50):
     else:
         results = worker.run_test(0, env)  # for Leader-Follower
     if i < 5:
+        # 这里是完成前5个测试环境的可视化，保存甘特图和动画
         worker.baseline_env.plot_gantt(
             save_path=f'{testSet}/gantt_{FOLDER_NAME}_{METHOD}_{i}.png',
             title=f'{METHOD} Episode {i} | makespan={worker.baseline_env.current_time:.2f}',
             show_text=True
+        )
+
+        worker.baseline_env.plot_animation(
+            path=f'{testSet}/animation_{FOLDER_NAME}_{METHOD}_{i}/',
+            n = i
         )
 
     df_ = pd.DataFrame(results, index=[i])

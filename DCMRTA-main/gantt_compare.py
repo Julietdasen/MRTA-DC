@@ -14,9 +14,9 @@ import numpy as np
 
 from env.task_env import TaskEnv
 
-# Compat for old pickle files that store TaskEnv as __main__.TaskEnv
-import __main__
-setattr(__main__, "TaskEnv", TaskEnv)
+# # Compat for old pickle files that store TaskEnv as __main__.TaskEnv
+# import __main__
+# setattr(__main__, "TaskEnv", TaskEnv)
 
 
 EMBEDDING_DIM = 128
